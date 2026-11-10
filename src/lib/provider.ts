@@ -74,6 +74,16 @@ export async function getOwnProfile(actor: Actor): Promise<OwnerProfile> {
   return row;
 }
 
+/** The actor's profile, or null when they haven't turned on bookings yet. */
+export async function getOwnProfileOrNull(actor: Actor): Promise<OwnerProfile | null> {
+  try {
+    return await getOwnProfile(actor);
+  } catch (err) {
+    if (err instanceof NotFoundError) return null;
+    throw err;
+  }
+}
+
 export async function upsertProfile(actor: Actor, input: unknown): Promise<OwnerProfile> {
   assertCan(actor, "create");
   const data = parseProfile(input);

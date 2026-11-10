@@ -247,4 +247,53 @@ history_c=$(curl -fsS -b "$JAR_C" "$BASE_URL/api/chat/$SLUG") || fail "customer 
 printf '%s' "$history_c" | grep -q "$PROPOSAL_ID" && fail "another customer's history leaked the proposal"
 pass "chat history is private and shows the spent card"
 
+# ---------------------------------------------------------------------------
+# Pages (7.3). Server-rendered HTML carries data-* hooks, so curl can check what each page shows to whom.
+# ---------------------------------------------------------------------------
+page() { curl -fsS -b "$1" "$BASE_URL$2"; }
+
+code=$(curl -s -o /dev/null -w '%{http_code}' "$BASE_URL/p/missing-studio")
+[ "$code" = "404" ] || fail "an unknown booking page should be 404, got $code"
+public_page=$(curl -fsS "$BASE_URL/p/$SLUG") || fail "public booking page did not render"
+echo "$public_page" | grep -q 'data-slot-picker' || fail "booking page is missing the slot picker"
+echo "$public_page" | grep -q "data-service-id=\"$SERVICE_ID\"" || fail "booking page should list the active service"
+echo "$public_page" | grep -q 'Smoke Studio' || fail "booking page should show the provider name"
+pass "public booking page renders the provider and services without signing in"
+
+for path in /bookings /provider /provider/calendar; do
+  code=$(curl -s -o /dev/null -w '%{http_code}' "$BASE_URL$path")
+  [ "$code" = "307" ] || fail "signed-out $path should redirect (307), got $code"
+done
+code=$(curl -s -o /dev/null -w '%{http_code}' -b "$JAR_A" "$BASE_URL/admin")
+[ "$code" = "307" ] || fail "a non-admin on /admin should be redirected (307), got $code"
+pass "private pages redirect when signed out, /admin redirects non-admins"
+
+setup=$(page "$JAR_A" /provider) || fail "provider setup page did not render"
+for hook in 'data-form="profile"' 'data-form="hours"' 'data-form="overrides"' 'data-feed-exists="true"'; do
+  echo "$setup" | grep -q "$hook" || fail "provider setup is missing $hook"
+done
+if echo "$setup" | grep -q "${FEED_URL##*/api/calendar/}"; then fail "provider setup leaked the old feed token"; fi
+pass "provider setup shows its forms, and never a feed token"
+
+mine_d=$(page "$JAR_D" /bookings) || fail "customer bookings page did not render"
+echo "$mine_d" | grep -q 'data-status="confirmed"' || fail "customer B should see a confirmed booking"
+if echo "$mine_d" | grep -q "data-booking-id=\"$BOOKING_ID\""; then fail "customer B can see customer A's booking on /bookings"; fi
+mine_c=$(page "$JAR_C" /bookings) || fail "customer A bookings page did not render"
+echo "$mine_c" | grep -q "data-booking-id=\"$BOOKING_ID\"" || fail "customer A should see their booking"
+echo "$mine_c" | grep -q 'data-status="cancelled"' || fail "customer A's cancelled booking should be marked cancelled"
+mine_b=$(page "$JAR_B" /bookings) || fail "empty bookings page did not render"
+echo "$mine_b" | grep -q 'data-empty="upcoming"' || fail "a user with no bookings should see the empty state"
+pass "my bookings shows only my own bookings, with status and empty states"
+
+agenda=$(page "$JAR_A" /provider/calendar) || fail "provider calendar did not render"
+echo "$agenda" | grep -q "data-booking-id=\"$BOOKING_ID\"" || fail "provider calendar should list the booking made on the page"
+echo "$agenda" | grep -q 'data-role="provider"' || fail "provider calendar should show the provider's side"
+if echo "$agenda" | grep -q "smoke-c-$RUN_ID"; then fail "provider calendar leaked a customer email"; fi
+pass "provider calendar lists bookings made on the page, without customer emails"
+
+signin=$(curl -fsS "$BASE_URL/sign-in?next=//evil.example") || fail "sign-in with a next param did not render"
+echo "$signin" | grep -q '\\"next\\":\\"/dashboard\\"' || fail "sign-in should fall back to /dashboard for an off-site next target"
+echo "$signin" | grep -q '\\"next\\":\\"//evil' && fail "sign-in passed an off-site next target to the form"
+pass "sign-in ignores an off-site next target"
+
 echo "SMOKE PASS"

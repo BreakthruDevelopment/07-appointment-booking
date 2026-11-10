@@ -5,7 +5,7 @@ import { useState } from "react";
 import { buttonPrimary, inputClass, labelClass } from "@/components/ui/styles";
 import { signIn, signUp } from "@/lib/auth/client";
 
-export function SignInForm() {
+export function SignInForm({ next = "/dashboard" }: { next?: string }) {
   const router = useRouter();
   const [mode, setMode] = useState<"sign-in" | "sign-up">("sign-in");
   const [error, setError] = useState<string | null>(null);
@@ -26,7 +26,7 @@ export function SignInForm() {
       setError(result.error.message ?? "That didn't work. Check your details and try again.");
       return;
     }
-    router.push("/dashboard");
+    router.push(next);
     router.refresh();
   }
 
