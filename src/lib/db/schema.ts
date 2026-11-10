@@ -232,6 +232,8 @@ export const booking = pgTable(
     ),
     check("booking_time_chk", sql`${t.endsAt} > ${t.startsAt}`),
     check("booking_blocked_contains_slot", sql`${t.blocked} @> ${t.slot}`),
+    check("booking_slot_half_open", sql`lower_inc(${t.slot}) and not upper_inc(${t.slot})`),
+    check("booking_blocked_half_open", sql`lower_inc(${t.blocked}) and not upper_inc(${t.blocked})`),
     check("booking_slot_bounds", sql`lower(${t.slot}) = ${t.startsAt} and upper(${t.slot}) = ${t.endsAt}`),
     check("booking_sequence_chk", sql`${t.sequence} >= 0`),
     check("booking_note_len", sql`${t.customerNote} is null or char_length(${t.customerNote}) <= 300`),

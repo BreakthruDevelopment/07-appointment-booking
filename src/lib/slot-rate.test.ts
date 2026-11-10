@@ -11,11 +11,21 @@ describe("slot rate limit", () => {
     expect(() => assertSlotRate("203.0.113.5", now + 60_000)).not.toThrow();
   });
 
-  it("reads the first forwarded address", () => {
+  it("reads the last forwarded address, which the platform appends", () => {
     const request = new Request("http://localhost/api/providers/demo/slots", {
       headers: { "x-forwarded-for": "198.51.100.4, 10.0.0.1" },
     });
-    expect(clientIp(request)).toBe("198.51.100.4");
+    expect(clientIp(request)).toBe("10.0.0.1");
     expect(clientIp(new Request("http://localhost/"))).toBe("unknown");
+  });
+
+  it("evicts the oldest key past 10,000 so made-up addresses can't grow the map", () => {
+    resetSlotRate();
+    const now = 1_700_000_000_000;
+    for (let i = 0; i < 60; i++) assertSlotRate("victim", now);
+    expect(() => assertSlotRate("victim", now)).toThrow(/Too many/);
+    for (let i = 0; i < 10_000; i++) assertSlotRate(`spoof-${i}`, now);
+    // "victim" was the oldest key, so it was evicted and starts a fresh bucket.
+    expect(() => assertSlotRate("victim", now)).not.toThrow();
   });
 });

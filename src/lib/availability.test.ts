@@ -37,6 +37,38 @@ describe("availableSlots", () => {
     ]);
   });
 
+  it("keeps an interval whose end is a midnight that doesn't exist (America/Santiago 2026-09-05)", () => {
+    const slots = availableSlots(
+      at({
+        profile: { timeZone: "America/Santiago", accepting: true, minNoticeMinutes: 0, horizonDays: 60 },
+        service: { durationMin: 30, bufferBeforeMin: 0, bufferAfterMin: 0, active: true },
+        hours: [{ weekday: 6, startMin: 22 * 60, endMin: 24 * 60 }],
+        from: new Date("2026-09-05T00:00:00Z"),
+        to: new Date("2026-09-06T12:00:00Z"),
+        now: new Date("2026-09-01T00:00:00Z"),
+      }),
+    );
+    // 22:00 to 23:30 local (UTC-4), every 15 minutes.
+    expect(slots).toHaveLength(7);
+    expect(slots[0].start.toISOString()).toBe("2026-09-06T02:00:00.000Z");
+    expect(slots[6].start.toISOString()).toBe("2026-09-06T03:30:00.000Z");
+  });
+
+  it("ends an interval that finishes inside the America/New_York spring-forward gap at the transition", () => {
+    const slots = availableSlots(
+      at({
+        profile: { timeZone: "America/New_York", accepting: true, minNoticeMinutes: 0, horizonDays: 60 },
+        service: { durationMin: 30, bufferBeforeMin: 0, bufferAfterMin: 0, active: true },
+        hours: open(60, 150),
+        from: new Date("2026-03-08T00:00:00Z"),
+        to: new Date("2026-03-09T00:00:00Z"),
+        now: new Date("2026-03-01T00:00:00Z"),
+      }),
+    );
+    // 01:00, 01:15, 01:30 EST. A 01:45 start would run past the 03:00 EDT transition.
+    expect(iso(slots)).toEqual(["2026-03-08T06:00:00.000Z", "2026-03-08T06:15:00.000Z", "2026-03-08T06:30:00.000Z"]);
+  });
+
   it("uses the first occurrence of an ambiguous America/New_York fall-back time", () => {
     const slots = availableSlots(
       at({
@@ -274,5 +306,12 @@ describe("parseSlotWindow", () => {
     expect(() => parseSlotWindow(from, new Date(Date.parse(to) + 1).toISOString())).toThrow(/14 days/);
     expect(() => parseSlotWindow(from, from)).toThrow(/after from/);
     expect(() => parseSlotWindow(null, to)).toThrow();
+  });
+
+  it("takes only ISO 8601 date-times with Z or an offset", () => {
+    expect(parseSlotWindow("2026-06-01T00:00:00Z", "2026-06-02T00:00:00+02:00").to.toISOString()).toBe("2026-06-01T22:00:00.000Z");
+    for (const bad of ["June 1 2026", "2026-06-01", "1780000000000", "2026-06-01T00:00:00", "tomorrow"]) {
+      expect(() => parseSlotWindow(bad, "2026-06-02T00:00:00Z"), bad).toThrow(/ISO 8601/);
+    }
   });
 });

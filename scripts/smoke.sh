@@ -89,6 +89,16 @@ printf '%s' "$public" | node -e 'let s="";process.stdin.on("data",d=>s+=d);proce
   || fail "public provider leaked an owner field or missed the display name: $public"
 pass "public provider hides the owner"
 
+code=$(curl -s -o /dev/null -w '%{http_code}' "$BASE_URL/api/providers/smoke-b-$RUN_ID")
+[ "$code" = "404" ] || fail "a provider who is not accepting bookings should be 404 publicly, got $code"
+pass "non-accepting provider is not public"
+
+code=$(curl -s -o /dev/null -w '%{http_code}' -X PUT -b "$JAR_A" -H 'content-type: application/json' -H 'origin: https://evil.example' \
+  -d "{\"slug\":\"$SLUG\",\"displayName\":\"Hijack\",\"bio\":\"\",\"timeZone\":\"UTC\",\"accepting\":true,\"minNoticeMinutes\":0,\"horizonDays\":30}" \
+  "$BASE_URL/api/provider/profile")
+[ "$code" = "403" ] || fail "cross-origin profile PUT should be 403, got $code"
+pass "cross-origin write is refused"
+
 FROM=$(node -e 'process.stdout.write(new Date(Date.now()+60*60*1000).toISOString())')
 TO=$(node -e 'process.stdout.write(new Date(Date.now()+2*24*60*60*1000).toISOString())')
 slots=$(curl -fsS --get "$BASE_URL/api/providers/$SLUG/slots" \

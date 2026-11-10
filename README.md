@@ -12,6 +12,11 @@ constraints reject a second hold on the same time for that provider, and a secon
 the same customer. Provider setup is private to that user, including from an admin. Booking, cancel, calendar
 feeds, and the chat assistant are separate steps.
 
+Daylight-saving edge cases: in the fall-back hour (a wall-clock time that happens twice) the first occurrence is
+used, so the repeated hour is not bookable and an opening interval that ends on a repeated time is shortened to
+end at its first occurrence, leaving a one-hour hole. In the spring-forward gap, start times that don't exist are
+skipped, and an interval that ends inside the gap ends at the moment the clocks jump.
+
 ## Architecture
 
 ```

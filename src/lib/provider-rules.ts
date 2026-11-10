@@ -46,7 +46,8 @@ export function isKnownZone(timeZone: string): boolean {
 const slug = z
   .string()
   .trim()
-  .regex(/^[a-z0-9-]{3,40}$/, "Use 3–40 lowercase letters, numbers, or hyphens.");
+  .regex(/^[a-z0-9](?:[a-z0-9-]{1,38}[a-z0-9])$/, "Use 3–40 lowercase letters, numbers, or hyphens, starting and ending with a letter or number.")
+  .refine((value) => !value.includes("--"), "Hyphens can't be doubled.");
 
 export const profileInput = z.object({
   slug,
@@ -75,7 +76,6 @@ export const serviceInput = z.object({
 });
 
 const hourRow = z.object({
-  id: z.uuid().optional(),
   weekday: z.number().int().min(1).max(7),
   startMin: z.number().int(),
   endMin: z.number().int(),

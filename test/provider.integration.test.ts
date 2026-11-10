@@ -81,15 +81,36 @@ describe.skipIf(!url)("provider setup (Postgres)", () => {
     await deleteService(alice, service.id);
   });
 
-  it("answers 404 when hours include an id the caller does not own", async () => {
+  it("replaces only the caller's own hours, whoever else saves theirs", async () => {
     const { listHours, replaceHours } = await import("@/lib/provider");
     const saved = await replaceHours(alice, { hours: [{ weekday: 1, startMin: 9 * 60, endMin: 12 * 60 }] });
+    // A client-supplied id is ignored: bob and the admin only ever write rows under their own id.
     const foreign = { hours: [{ id: saved[0]?.id, weekday: 2, startMin: 9 * 60, endMin: 12 * 60 }] };
-    await expect(replaceHours(bob, foreign)).rejects.toMatchObject({ status: 404 });
-    await expect(replaceHours(admin, foreign)).rejects.toMatchObject({ status: 404 });
+    await replaceHours(bob, foreign);
+    await replaceHours(admin, foreign);
     const still = await listHours(alice);
     expect(still.map((row) => row.id)).toEqual([saved[0]?.id]);
+    expect(still[0]?.weekday).toBe(1);
+    expect((await listHours(bob)).every((row) => row.id !== saved[0]?.id)).toBe(true);
     await replaceHours(alice, { hours: [] });
+    await replaceHours(bob, { hours: [] });
+    await replaceHours(admin, { hours: [] });
+  });
+
+  it("hides a provider who is not accepting bookings from the public page", async () => {
+    const { getPublicProvider, upsertProfile } = await import("@/lib/provider");
+    await upsertProfile(bob, { ...profileBody("pv-bob"), accepting: false });
+    await expect(getPublicProvider("pv-bob")).resolves.toBeNull();
+    await upsertProfile(bob, profileBody("pv-bob"));
+    await expect(getPublicProvider("pv-bob")).resolves.toMatchObject({ displayName: "pv-bob" });
+  });
+
+  it("validates time zones against Postgres' case-sensitive names too", async () => {
+    const { upsertProfile } = await import("@/lib/provider");
+    // Intl accepts any case, pg_timezone_names does not, and the database value must be the real name.
+    await expect(upsertProfile(bob, { ...profileBody("pv-bob"), timeZone: "america/new_york" })).rejects.toMatchObject({ status: 400 });
+    await expect(upsertProfile(bob, { ...profileBody("pv-bob"), timeZone: "America/New_York" })).resolves.toMatchObject({ timeZone: "America/New_York" });
+    await upsertProfile(bob, profileBody("pv-bob"));
   });
 
   it("enforces the service cap, overlapping hours, reserved slugs, and taken slugs", async () => {
@@ -214,5 +235,20 @@ describe.skipIf(!url)("provider setup (Postgres)", () => {
 
     await expect(loadAvailability(alice.id, "00000000-0000-4000-8000-000000000000", new Date("2026-06-15T00:00:00Z"), new Date("2026-06-16T00:00:00Z"))).resolves.toBeNull();
     await expect(deleteService(alice, aliceService.id)).rejects.toMatchObject({ status: 409 });
+  });
+
+  it("loads the same availability inputs by public slug", async () => {
+    const { listServices } = await import("@/lib/provider");
+    const { loadAvailability, loadAvailabilityBySlug } = await import("@/lib/availability");
+    const [service] = await listServices(alice);
+    const from = new Date("2026-06-15T00:00:00Z");
+    const to = new Date("2026-06-16T00:00:00Z");
+    const bySlug = await loadAvailabilityBySlug("pv-alice", service.id, from, to);
+    expect(bySlug).not.toBeNull();
+    expect(bySlug).toEqual(await loadAvailability(alice.id, service.id, from, to));
+    expect(bySlug!.busy.length).toBeGreaterThan(0);
+    await expect(loadAvailabilityBySlug("pv-nobody", service.id, from, to)).resolves.toBeNull();
+    // A service id that belongs to another provider doesn't resolve under this slug.
+    await expect(loadAvailabilityBySlug("pv-dave", service.id, from, to)).resolves.toBeNull();
   });
 });

@@ -1,5 +1,5 @@
 import "server-only";
-import { and, asc, count, eq, inArray, sql } from "drizzle-orm";
+import { and, asc, count, eq, sql } from "drizzle-orm";
 import { z } from "zod";
 import { type Actor, assertCan } from "@/lib/auth/rbac";
 import { db, schema } from "@/lib/db";
@@ -8,7 +8,6 @@ import { BadRequestError, ConflictError, NotFoundError } from "@/lib/errors";
 import { log } from "@/lib/log";
 import {
   MAX_SERVICES,
-  type HoursInput,
   type ProfileInput,
   type ServiceInput,
   parseHours,
@@ -97,7 +96,7 @@ export async function getPublicProvider(slug: string): Promise<PublicProvider | 
   const [row] = await db()
     .select({ userId: schema.providerProfile.userId, ...profileColumns })
     .from(schema.providerProfile)
-    .where(eq(schema.providerProfile.slug, slug));
+    .where(and(eq(schema.providerProfile.slug, slug), eq(schema.providerProfile.accepting, true)));
   if (!row) return null;
   const { userId, ...profile } = row;
   const services = await db()
@@ -133,7 +132,7 @@ export async function saveService(actor: Actor, input: unknown): Promise<OwnerSe
       const [row] = await tx
         .update(schema.service)
         .set(serviceValues(actor.id, data, data.position ?? existing.position))
-        .where(eq(schema.service.id, data.id))
+        .where(and(eq(schema.service.id, data.id), eq(schema.service.providerId, actor.id)))
         .returning(serviceColumns);
       log.info("provider.service_saved", { userId: actor.id, serviceId: row.id });
       return row;
@@ -188,7 +187,6 @@ export async function replaceHours(actor: Actor, input: unknown) {
   return db().transaction(async (tx) => {
     await advisoryLock(tx, `hours:${actor.id}`);
     await requireProfile(actor, tx);
-    await assertOwnedHourIds(tx, actor, data);
     await tx.delete(schema.weeklyHours).where(eq(schema.weeklyHours.providerId, actor.id));
     if (data.hours.length === 0) return [];
     const rows = await tx
@@ -278,16 +276,6 @@ async function requireProfile(actor: Actor, tx?: Tx): Promise<ProfileInput & { u
     .where(eq(schema.providerProfile.userId, actor.id));
   if (!row) throw new NotFoundError("Set up your provider profile first.");
   return row;
-}
-
-async function assertOwnedHourIds(tx: Tx, actor: Actor, data: HoursInput) {
-  const ids = [...new Set(data.hours.flatMap((hour) => (hour.id ? [hour.id] : [])))];
-  if (ids.length === 0) return;
-  const rows = await tx
-    .select({ id: schema.weeklyHours.id })
-    .from(schema.weeklyHours)
-    .where(and(eq(schema.weeklyHours.providerId, actor.id), inArray(schema.weeklyHours.id, ids)));
-  if (rows.length !== ids.length) throw new NotFoundError();
 }
 
 async function assertPgTimeZone(timeZone: string) {

@@ -44,13 +44,15 @@ export type AvailabilityInput = {
 export type Slot = { start: Date };
 
 const slotWindow = z.object({
-  from: z.string().min(1),
-  to: z.string().min(1),
+  from: z.iso.datetime({ offset: true }),
+  to: z.iso.datetime({ offset: true }),
 });
 
 /** `from`/`to` are UTC instants. The span is at most 14 days, `to` strictly after `from`. */
 export function parseSlotWindow(fromRaw: string | null, toRaw: string | null): { from: Date; to: Date } {
-  const parsed = slotWindow.parse({ from: fromRaw ?? "", to: toRaw ?? "" });
+  const result = slotWindow.safeParse({ from: fromRaw ?? "", to: toRaw ?? "" });
+  if (!result.success) throw new BadRequestError("from and to must be ISO 8601 date-times with a Z or an offset.");
+  const parsed = result.data;
   const from = new Date(parsed.from);
   const to = new Date(parsed.to);
   if (Number.isNaN(from.getTime()) || Number.isNaN(to.getTime())) {
@@ -94,7 +96,7 @@ export function availableSlots(input: AvailabilityInput): Slot[] {
       : hours.filter((h) => h.weekday === isoWeekday(date, profile.timeZone));
 
     for (const interval of intervals) {
-      const intervalEnd = zonedInstant(date, interval.endMin, profile.timeZone);
+      const intervalEnd = zonedEndInstant(date, interval.endMin, profile.timeZone);
       if (!intervalEnd) continue;
       for (let minute = interval.startMin; minute < interval.endMin; minute += SLOT_STEP_MIN) {
         const start = zonedInstant(date, minute, profile.timeZone);
@@ -270,6 +272,19 @@ function zonedInstant(date: string, minutes: number, timeZone: string): Date | n
     }
   }
   return new Date(earliest);
+}
+
+/**
+ * Like `zonedInstant`, for the END of a working interval. An end inside a spring-forward gap (or at
+ * a midnight that doesn't exist, as in America/Santiago) resolves to the first instant after the
+ * transition instead of dropping the whole interval.
+ */
+function zonedEndInstant(date: string, minutes: number, timeZone: string): Date | null {
+  for (let extra = 0; extra <= 240; extra++) {
+    const resolved = zonedInstant(date, minutes + extra, timeZone);
+    if (resolved) return resolved;
+  }
+  return null;
 }
 
 function isoWeekday(date: string, timeZone: string): number {
