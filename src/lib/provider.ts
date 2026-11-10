@@ -230,6 +230,7 @@ export async function replaceOverrides(actor: Actor, input: unknown, now = new D
   const data = parseOverrides(input, todayInZone(profile.timeZone, now));
   return db().transaction(async (tx) => {
     await advisoryLock(tx, `overrides:${actor.id}`);
+    await requireProfile(actor, tx);
     await tx.delete(schema.dateOverride).where(eq(schema.dateOverride.providerId, actor.id));
     if (data.overrides.length === 0) return [];
     const rows = await tx
@@ -267,13 +268,16 @@ function serviceValues(providerId: string, data: ServiceInput, position: number)
 
 async function requireProfile(actor: Actor, tx?: Tx): Promise<ProfileInput & { userId: string }> {
   const handle = tx ?? db();
-  const [row] = await handle
+  const query = handle
     .select({
       userId: schema.providerProfile.userId,
       ...profileColumns,
     })
     .from(schema.providerProfile)
     .where(eq(schema.providerProfile.userId, actor.id));
+  // Inside a transaction, hold the profile row so a booking being made right now (it takes FOR SHARE on it)
+  // finishes before this edit, or sees the edit; see createBooking.
+  const [row] = await (tx ? query.for("update") : query);
   if (!row) throw new NotFoundError("Set up your provider profile first.");
   return row;
 }

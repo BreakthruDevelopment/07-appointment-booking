@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 # End-to-end smoke test against a running app (local, CI, or a deployed URL).
-# Signs up two users, publishes one provider, and proves the other cannot edit that service.
+# Signs up users, publishes one provider, proves the other cannot edit that service, then runs the booking flow:
+# customer A books, customer B gets 409 for the same time and 404 on A's booking and .ics, A cancels,
+# and the provider's private calendar feed shows the cancelled booking.
 #   BASE_URL=https://app7.breakthruventures.ai ./scripts/smoke.sh
 set -euo pipefail
 
 BASE_URL="${BASE_URL:-http://localhost:3000}"
 RUN_ID="$(date +%s)$RANDOM"
-JAR_A="$(mktemp)"; JAR_B="$(mktemp)"
-trap 'rm -f "$JAR_A" "$JAR_B"' EXIT
+JAR_A="$(mktemp)"; JAR_B="$(mktemp)"; JAR_C="$(mktemp)"; JAR_D="$(mktemp)"
+trap 'rm -f "$JAR_A" "$JAR_B" "$JAR_C" "$JAR_D"' EXIT
 
 fail() { echo "SMOKE FAIL: $*" >&2; exit 1; }
 pass() { echo "ok - $*"; }
@@ -29,10 +31,17 @@ done
 pass "signed-out dashboard and admin redirect"
 
 signup() {
-  local jar=$1 email=$2
-  curl -fsS -c "$jar" -b "$jar" -H 'content-type: application/json' -H "origin: $BASE_URL" \
-    -d "{\"email\":\"$email\",\"password\":\"smoke-test-password-1\",\"name\":\"Smoke\"}" \
-    "$BASE_URL/api/auth/sign-up/email" >/dev/null || fail "sign-up failed for $email"
+  local jar=$1 email=$2 code attempt
+  # Better Auth rate-limits sign-ups per IP (a few per 10 seconds); wait it out and retry.
+  for attempt in 1 2 3 4 5 6; do
+    code=$(curl -s -o /dev/null -w '%{http_code}' -c "$jar" -b "$jar" -H 'content-type: application/json' -H "origin: $BASE_URL" \
+      -d "{\"email\":\"$email\",\"password\":\"smoke-test-password-1\",\"name\":\"Smoke Tester\"}" \
+      "$BASE_URL/api/auth/sign-up/email")
+    [ "$code" = "200" ] && return 0
+    [ "$code" = "429" ] || fail "sign-up failed for $email (HTTP $code)"
+    sleep 5
+  done
+  fail "sign-up for $email kept hitting the rate limit"
 }
 
 json_field() {
@@ -108,5 +117,90 @@ slots=$(curl -fsS --get "$BASE_URL/api/providers/$SLUG/slots" \
 printf '%s' "$slots" | node -e 'let s="";process.stdin.on("data",d=>s+=d);process.stdin.on("end",()=>{const j=JSON.parse(s); if(j.timeZone!=="UTC"||!Array.isArray(j.slots)||j.slots.length===0) process.exit(1);});' \
   || fail "expected at least one open slot: $slots"
 pass "public slots include an open time"
+
+# ---------------------------------------------------------------------------
+# Bookings: A and B are the customers here (users C and D), the provider is user A above.
+# ---------------------------------------------------------------------------
+signup "$JAR_C" "smoke-c-$RUN_ID@example.test"
+signup "$JAR_D" "smoke-d-$RUN_ID@example.test"
+pass "two customers signed up"
+
+SLOT=$(printf '%s' "$slots" | json_field slots.0) || fail "no slot to book in $slots"
+
+code=$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'content-type: application/json' -H "origin: $BASE_URL" \
+  -d "{\"serviceId\":\"$SERVICE_ID\",\"startsAt\":\"$SLOT\"}" "$BASE_URL/api/bookings")
+[ "$code" = "401" ] || fail "anonymous booking should be 401, got $code"
+code=$(curl -s -o /dev/null -w '%{http_code}' -X POST -b "$JAR_C" -H 'content-type: application/json' -H 'origin: https://evil.example' \
+  -d "{\"serviceId\":\"$SERVICE_ID\",\"startsAt\":\"$SLOT\"}" "$BASE_URL/api/bookings")
+[ "$code" = "403" ] || fail "cross-origin booking should be 403, got $code"
+pass "anonymous and cross-origin bookings are refused"
+
+code=$(curl -s -o /dev/null -w '%{http_code}' -X POST -b "$JAR_C" -H 'content-type: application/json' -H "origin: $BASE_URL" \
+  -d "{\"serviceId\":\"$SERVICE_ID\",\"startsAt\":\"2000-01-01T00:00:00Z\"}" "$BASE_URL/api/bookings")
+[ "$code" = "409" ] || fail "a time that was never on offer should be 409, got $code"
+pass "a time outside availability is refused, whatever the client says"
+
+booked=$(curl -fsS -b "$JAR_C" -H 'content-type: application/json' -H "origin: $BASE_URL" \
+  -d "{\"serviceId\":\"$SERVICE_ID\",\"startsAt\":\"$SLOT\",\"note\":\"smoke\"}" "$BASE_URL/api/bookings") || fail "customer A could not book $SLOT"
+BOOKING_ID=$(printf '%s' "$booked" | json_field booking.id) || fail "no booking id in $booked"
+pass "customer A booked an open slot"
+
+taken=$(curl -s -w '\n%{http_code}' -X POST -b "$JAR_D" -H 'content-type: application/json' -H "origin: $BASE_URL" \
+  -d "{\"serviceId\":\"$SERVICE_ID\",\"startsAt\":\"$SLOT\"}" "$BASE_URL/api/bookings")
+[ "$(printf '%s' "$taken" | tail -n1)" = "409" ] || fail "customer B booking the same slot should be 409, got: $taken"
+printf '%s' "$taken" | head -n1 | node -e 'let s="";process.stdin.on("data",d=>s+=d);process.stdin.on("end",()=>{const j=JSON.parse(s); if(j.code!=="slot_taken"||!Array.isArray(j.slots)||j.slots.includes(process.argv[1])) process.exit(1);});' "$SLOT" \
+  || fail "409 should say slot_taken and offer fresh slots without the taken one: $taken"
+pass "customer B gets 409 with fresh slots for the same time"
+
+for path in "/api/bookings/$BOOKING_ID" "/api/bookings/$BOOKING_ID/ics"; do
+  code=$(curl -s -o /dev/null -w '%{http_code}' -b "$JAR_D" "$BASE_URL$path")
+  [ "$code" = "404" ] || fail "customer B on $path should be 404, got $code"
+done
+code=$(curl -s -o /dev/null -w '%{http_code}' -X POST -b "$JAR_D" -H "origin: $BASE_URL" "$BASE_URL/api/bookings/$BOOKING_ID/cancel")
+[ "$code" = "404" ] || fail "customer B cancelling A's booking should be 404, got $code"
+pass "customer B gets 404 on A's booking, .ics and cancel"
+
+ics_headers=$(curl -sS -D - -o /dev/null -b "$JAR_C" "$BASE_URL/api/bookings/$BOOKING_ID/ics") || fail "ics request failed"
+echo "$ics_headers" | grep -qi '^content-type: text/calendar' || fail "ics should be text/calendar: $ics_headers"
+ics=$(curl -fsS -b "$JAR_C" "$BASE_URL/api/bookings/$BOOKING_ID/ics") || fail "customer A could not download the .ics"
+echo "$ics" | grep -q 'STATUS:CONFIRMED' || fail ".ics should be confirmed: $ics"
+pass "customer A downloads the .ics"
+curl -fsS -b "$JAR_A" "$BASE_URL/api/bookings/$BOOKING_ID/ics" >/dev/null || fail "the provider could not download the .ics"
+pass "the provider can read it too"
+
+code=$(curl -s -o /dev/null -w '%{http_code}' -X POST -b "$JAR_C" -H "origin: $BASE_URL" "$BASE_URL/api/provider/feed")
+[ "$code" = "404" ] || fail "a customer without a provider profile should not get a feed, got $code"
+feed=$(curl -fsS -b "$JAR_A" -X POST -H "origin: $BASE_URL" "$BASE_URL/api/provider/feed") || fail "provider could not create a feed"
+FEED_URL=$(printf '%s' "$feed" | json_field url) || fail "no feed url in $feed"
+FEED_PATH="/api/calendar/${FEED_URL##*/api/calendar/}"
+feed_ics=$(curl -fsS "$BASE_URL$FEED_PATH") || fail "feed not served at $FEED_PATH"
+echo "$feed_ics" | grep -q "UID:$BOOKING_ID@" || fail "feed should list the booking"
+echo "$feed_ics" | grep -q 'STATUS:CONFIRMED' || fail "feed should show the booking as confirmed"
+if echo "$feed_ics" | grep -q '@example.test'; then fail "feed leaked an email address"; fi
+pass "provider feed lists the booking without an email"
+
+code=$(curl -s -o /dev/null -w '%{http_code}' "$BASE_URL/api/calendar/not-a-real-token.ics")
+[ "$code" = "404" ] || fail "an unknown feed token should be 404, got $code"
+pass "unknown feed token is 404"
+
+cancelled=$(curl -fsS -X POST -b "$JAR_C" -H "origin: $BASE_URL" "$BASE_URL/api/bookings/$BOOKING_ID/cancel") || fail "customer A could not cancel"
+printf '%s' "$cancelled" | json_field booking.status | grep -qx cancelled || fail "booking should be cancelled: $cancelled"
+again=$(curl -fsS -X POST -b "$JAR_C" -H "origin: $BASE_URL" "$BASE_URL/api/bookings/$BOOKING_ID/cancel") || fail "cancelling twice should be fine"
+printf '%s' "$again" | json_field booking.sequence | grep -qx 1 || fail "second cancel should leave sequence at 1: $again"
+pass "customer A cancelled, and cancelling again is harmless"
+
+feed_ics=$(curl -fsS "$BASE_URL$FEED_PATH") || fail "feed not served after cancel"
+echo "$feed_ics" | grep -q 'STATUS:CANCELLED' || fail "feed should show the cancelled booking: $feed_ics"
+pass "feed shows the booking as cancelled"
+
+rebook=$(curl -s -o /dev/null -w '%{http_code}' -b "$JAR_D" -H 'content-type: application/json' -H "origin: $BASE_URL" \
+  -d "{\"serviceId\":\"$SERVICE_ID\",\"startsAt\":\"$SLOT\"}" "$BASE_URL/api/bookings")
+[ "$rebook" = "201" ] || fail "customer B should be able to take the freed slot, got $rebook"
+pass "the cancelled slot is bookable again"
+
+curl -fsS -b "$JAR_A" -X POST -H "origin: $BASE_URL" "$BASE_URL/api/provider/feed" >/dev/null || fail "feed rotate failed"
+code=$(curl -s -o /dev/null -w '%{http_code}' "$BASE_URL$FEED_PATH")
+[ "$code" = "404" ] || fail "the old feed URL should stop working after a rotate, got $code"
+pass "rotating the feed kills the old URL"
 
 echo "SMOKE PASS"

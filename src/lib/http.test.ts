@@ -95,3 +95,11 @@ describe("errorResponse logging (issue #16)", () => {
     spy.mockRestore();
   });
 });
+
+describe("errorInfo extra fields", () => {
+  it("merges client-safe extras (a code and fresh slots) into a 409 body", () => {
+    const info = errorInfo(new ConflictError("That time was just taken.", { code: "slot_taken", slots: ["2026-06-03T10:30:00.000Z"] }));
+    expect(info.status).toBe(409);
+    expect(info.body).toEqual({ error: "That time was just taken.", code: "slot_taken", slots: ["2026-06-03T10:30:00.000Z"] });
+  });
+});
