@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { confirmProposal } from "@/lib/assistant/proposals";
+import { confirmProposal, parseProposalId } from "@/lib/assistant/proposals";
 import { requireUser } from "@/lib/auth/session";
 import { createBooking, listBookings } from "@/lib/bookings";
 import { requireSameOrigin } from "@/lib/csrf";
@@ -19,7 +19,7 @@ export async function GET(request: Request) {
 }
 
 // Confirming takes the proposal id and nothing else: the service and time come from the stored proposal.
-const confirmInput = z.object({ proposalId: z.string().max(64) }).strict();
+const confirmInput = z.object({ proposalId: z.unknown() }).strict();
 
 /**
  * POST /api/bookings — `{ serviceId, startsAt, note? }`, or `{ proposalId }` to confirm the assistant's card.
@@ -34,7 +34,7 @@ export async function POST(request: Request) {
     const body = await readJson(request);
     if (body && typeof body === "object" && "proposalId" in body) {
       const { proposalId } = confirmInput.parse(body);
-      const done = await confirmProposal(user, proposalId);
+      const done = await confirmProposal(user, parseProposalId(proposalId));
       return Response.json(done, { status: done.action === "booked" ? 201 : 200 });
     }
     const booking = await createBooking(user, body);

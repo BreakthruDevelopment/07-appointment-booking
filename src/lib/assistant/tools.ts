@@ -10,7 +10,7 @@ import { db, schema } from "@/lib/db";
 import { HttpError } from "@/lib/errors";
 import { ownedBy } from "@/lib/owned";
 import { type ProposalScope, createBookProposal, createCancelProposal } from "./proposals";
-import type { PromptService } from "./prompt";
+import { type PromptService, sanitizeText } from "./prompt";
 
 /**
  * The assistant's tools. Built per request; the actor, provider and thread are bound HERE, in closures, and
@@ -118,11 +118,19 @@ export function createAssistantTools(scope: AssistantScope): AssistantTools {
       if (!loaded) throw new ToolError("That service isn't available.");
       const after = minutes(args.afterTime);
       const before = minutes(args.beforeTime);
-      const matching = availableSlots({ ...loaded, from: fromInstant, to: toInstant, now: scope.now }).filter((slot) => {
-        const local = new TZDate(slot.start.getTime(), scope.viewerTz);
-        const at = local.getHours() * 60 + local.getMinutes();
-        return (after === null || at >= after) && (before === null || at < before);
-      });
+      // Filter by time of day BEFORE the engine's 200-slot cap bites: one call per local day, so an evening-only
+      // search over 7 days still reaches the later evenings. Stops once one more than the result limit is found.
+      const matching: { start: Date }[] = [];
+      const days = Math.round((endMs - startMs) / 86_400_000) + 1;
+      for (let i = 0; i < days && matching.length <= MAX_SLOTS_PER_RESULT; i++) {
+        const dayFrom = new Date(new TZDate(from.y, from.m - 1, from.d + i, 0, 0, 0, scope.viewerTz).getTime());
+        const dayTo = new Date(new TZDate(from.y, from.m - 1, from.d + i + 1, 0, 0, 0, scope.viewerTz).getTime());
+        for (const slot of availableSlots({ ...loaded, from: dayFrom, to: dayTo, now: scope.now })) {
+          const local = new TZDate(slot.start.getTime(), scope.viewerTz);
+          const at = local.getHours() * 60 + local.getMinutes();
+          if ((after === null || at >= after) && (before === null || at < before)) matching.push(slot);
+        }
+      }
       const shown = matching.slice(0, MAX_SLOTS_PER_RESULT);
       slotRefs = new Map(shown.map((slot, i) => [`A${i + 1}`, { serviceId, startsAt: slot.start }]));
       return {
@@ -148,7 +156,7 @@ export function createAssistantTools(scope: AssistantScope): AssistantTools {
         created.push(made.id);
         return {
           proposalId: made.id,
-          summary: `${made.serviceName} on ${formatLocal(made.startsAt, scope.viewerTz)} (${scope.viewerTz}). Waiting for the customer to tap Confirm.`,
+          summary: `${sanitizeText(made.serviceName, 80)} on ${formatLocal(made.startsAt, scope.viewerTz)} (${scope.viewerTz}). Waiting for the customer to tap Confirm.`,
         };
       } catch (err) {
         return asToolError(err);
@@ -180,7 +188,7 @@ export function createAssistantTools(scope: AssistantScope): AssistantTools {
       bookingRefs = new Map(rows.map((r, i) => [`B${i + 1}`, r.id]));
       return {
         timeZone: scope.viewerTz,
-        bookings: rows.map((r, i) => ({ booking: `B${i + 1}`, service: r.serviceName, startLocal: formatLocal(r.startsAt, scope.viewerTz), startUtc: r.startsAt.toISOString() })),
+        bookings: rows.map((r, i) => ({ booking: `B${i + 1}`, service: sanitizeText(r.serviceName, 80), startLocal: formatLocal(r.startsAt, scope.viewerTz), startUtc: r.startsAt.toISOString() })),
       };
     },
   });
@@ -200,7 +208,7 @@ export function createAssistantTools(scope: AssistantScope): AssistantTools {
         created.push(made.id);
         return {
           proposalId: made.id,
-          summary: `Cancel ${made.serviceName} on ${formatLocal(made.startsAt, scope.viewerTz)} (${scope.viewerTz}). Waiting for the customer to tap Confirm.`,
+          summary: `Cancel ${sanitizeText(made.serviceName, 80)} on ${formatLocal(made.startsAt, scope.viewerTz)} (${scope.viewerTz}). Waiting for the customer to tap Confirm.`,
         };
       } catch (err) {
         return asToolError(err);

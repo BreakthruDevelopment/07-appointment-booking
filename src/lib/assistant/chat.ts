@@ -9,9 +9,9 @@ import { db, schema } from "@/lib/db";
 import { env } from "@/lib/env";
 import { BadRequestError, NotFoundError, TooManyRequestsError } from "@/lib/errors";
 import { log } from "@/lib/log";
-import { consumeRate, releaseDaily, reserveDaily } from "@/lib/usage";
+import { consumeRate, reserveDaily } from "@/lib/usage";
 import { MAX_SERVICE_REFS, buildSystemPrompt, sanitizeText } from "./prompt";
-import { type ProposalView, proposalViews } from "./proposals";
+import { type ProposalView, discardProposals, proposalViews } from "./proposals";
 import { createAssistantTools } from "./tools";
 
 /**
@@ -115,6 +115,7 @@ function textOf(content: StoredContent): string {
 
 /** Last 10 messages, at most 5,000 characters, oldest dropped first; always starts with a user message. */
 export async function loadHistory(actor: Actor, threadId: string): Promise<ChatMessage[]> {
+  assertCan(actor, "create");
   const rows = await db()
     .select({ role: schema.chatMessage.role, content: schema.chatMessage.content })
     .from(schema.chatMessage)
@@ -133,9 +134,18 @@ export async function loadHistory(actor: Actor, threadId: string): Promise<ChatM
   return messages;
 }
 
-/** Reserve this turn's budget: per-user turns per hour, then the app-wide daily step cap, in one short transaction. */
-async function reserveTurn(actor: Actor): Promise<{ steps: number }> {
-  const live = env().AI_PROVIDER !== "demo";
+/** True when a real model can be called: a live provider is selected AND its key is set (else generate() serves the demo). */
+function liveModelAvailable(): boolean {
+  const e = env();
+  return (e.AI_PROVIDER === "gemini" && !!e.GEMINI_API_KEY) || (e.AI_PROVIDER === "anthropic" && !!e.ANTHROPIC_API_KEY);
+}
+
+/**
+ * Reserve this turn's budget: per-user turns per hour, then (only when a real model can run) the app-wide daily
+ * step cap, in one short transaction. Reserved steps are never refunded: a live turn that fails after running steps
+ * still cost them, so nothing a user types can get the cap back.
+ */
+async function reserveTurn(actor: Actor, live: boolean): Promise<void> {
   const cap = env().CHAT_DAILY_CAP;
   await db().transaction(async (tx) => {
     await consumeRate(tx, actor.id, "chat", TURNS_PER_HOUR, `You can send ${TURNS_PER_HOUR} assistant messages per hour. Try again later or use the times on the page.`);
@@ -148,7 +158,6 @@ async function reserveTurn(actor: Actor): Promise<{ steps: number }> {
       }
     }
   });
-  return { steps: live ? STEPS_PER_TURN : 0 };
 }
 
 export async function runChatTurn(actor: Actor, slug: unknown, input: unknown, now = new Date()): Promise<TurnResult> {
@@ -157,7 +166,8 @@ export async function runChatTurn(actor: Actor, slug: unknown, input: unknown, n
   const provider = await loadProvider(actor, slug);
   const viewerTz = validZone(timeZone) ?? provider.timeZone;
   const threadId = await getOrCreateThread(actor, provider.id);
-  const reserved = await reserveTurn(actor);
+  const live = liveModelAvailable();
+  await reserveTurn(actor, live);
   const started = Date.now();
 
   const services = provider.services.map((s, i) => ({ ref: `S${i + 1}`, name: s.name, durationMin: s.durationMin }));
@@ -192,21 +202,26 @@ export async function runChatTurn(actor: Actor, slug: unknown, input: unknown, n
       maxOutputTokens: 600,
       demoContext: { today, serviceName: services[0]?.name },
     });
-    demo = result.demo;
-    reply = result.data.reply;
-    suggestions = result.data.suggestions.map((s) => sanitizeText(s, 40)).filter(Boolean);
-    // Only a proposal this turn's handlers created for this actor counts; if the model forgot to name it, the
-    // latest one is used. Either way the card is rendered from the row, not from anything the model wrote.
-    const mine = tools.created();
-    proposalId = result.data.proposalId && mine.includes(result.data.proposalId) ? result.data.proposalId : (mine.at(-1) ?? null);
-    if (demo && reserved.steps > 0) await releaseSteps(reserved.steps);
+    if (live && result.demo) {
+      // A live model that failed and fell back to the recorded script: never show the script's reply or card (the
+      // user didn't ask for that time). The steps it ran stay charged; whatever the script proposed is closed.
+      await discardProposals(actor, tools.created(), now);
+      reply = FALLBACK_REPLY;
+      fallback = true;
+    } else {
+      demo = result.demo;
+      reply = result.data.reply;
+      suggestions = result.data.suggestions.map((s) => sanitizeText(s, 40)).filter(Boolean);
+      // Only a proposal this turn's handlers created for this actor counts; if the model forgot to name it, the
+      // latest one is used. Either way the card is rendered from the row, not from anything the model wrote.
+      const mine = tools.created();
+      proposalId = result.data.proposalId && mine.includes(result.data.proposalId) ? result.data.proposalId : (mine.at(-1) ?? null);
+    }
   } catch (err) {
     if (err instanceof AiError && err.kind === "tool_loop") {
       reply = FALLBACK_REPLY;
       fallback = true;
     } else {
-      // A turn that never reached the model shouldn't spend the day's model steps.
-      if (reserved.steps > 0 && err instanceof AiError && err.kind === "input_rejected") await releaseSteps(reserved.steps);
       throw err;
     }
   }
@@ -238,12 +253,6 @@ export async function runChatTurn(actor: Actor, slug: unknown, input: unknown, n
     demo,
     fallback,
   };
-}
-
-async function releaseSteps(steps: number): Promise<void> {
-  await db().transaction(async (tx) => {
-    for (let i = 0; i < steps; i++) await releaseDaily(tx, "chat_step");
-  });
 }
 
 /** The customer's saved conversation with this provider (newest 50), cards rebuilt from the proposal rows. */

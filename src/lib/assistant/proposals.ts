@@ -1,5 +1,6 @@
 import "server-only";
 import { and, eq, gt, inArray, isNull } from "drizzle-orm";
+import { z } from "zod";
 import { type Actor, assertCan } from "@/lib/auth/rbac";
 import { availableSlots, loadAvailability } from "@/lib/availability";
 import { type BookingView, cancelBooking, createBooking } from "@/lib/bookings";
@@ -7,6 +8,7 @@ import { db, schema } from "@/lib/db";
 import { ConflictError, NotFoundError } from "@/lib/errors";
 import { log } from "@/lib/log";
 import { ownedBy } from "@/lib/owned";
+import { type Tx, advisoryLock } from "@/lib/usage";
 
 /**
  * Proposals: the only thing the assistant can write. A proposal is a row that says "this customer may be
@@ -46,7 +48,10 @@ async function assertOffered(providerId: string, serviceId: string, startsAt: Da
 }
 
 /** Older open proposals in the thread stop being confirmable once a newer one is made: the latest card wins. */
-async function supersedeOpen(scope: ProposalScope, now: Date, tx: Pick<ReturnType<typeof db>, "update">) {
+async function supersedeOpen(scope: ProposalScope, now: Date, tx: Tx) {
+  // One writer per thread at a time, so two concurrent proposals can't both stay open: the second waits, then
+  // supersedes the first. (Transaction-scoped; released at commit.)
+  await advisoryLock(tx, `proposal:thread:${scope.threadId}`);
   await tx
     .update(schema.bookingProposal)
     .set({ expiresAt: now })
@@ -139,12 +144,16 @@ export async function createCancelProposal(
   return { id, serviceName: row.serviceName, startsAt: row.startsAt, expiresAt };
 }
 
-function parseUuid(id: unknown): string {
-  const ok = typeof id === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id);
-  // A malformed id can't be anyone's proposal.
-  if (!ok) throw new NotFoundError();
-  return (id as string).toLowerCase();
+/** The one schema for a proposal id, at every boundary (routes and data functions). */
+export const proposalIdSchema = z.uuid();
+
+/** A malformed id can't be anyone's proposal: 404, the same answer as for someone else's. */
+export function parseProposalId(id: unknown): string {
+  const parsed = proposalIdSchema.safeParse(id);
+  if (!parsed.success) throw new NotFoundError();
+  return parsed.data.toLowerCase();
 }
+const parseUuid = parseProposalId;
 
 /**
  * Confirm a proposal: the customer's tap on the card. Single use, owner only.
@@ -218,6 +227,16 @@ export async function confirmProposal(
   }
   log.info("proposal.confirmed", { proposalId: id, kind: claimed.kind, bookingId: result.booking.id });
   return result;
+}
+
+/** Close proposals this turn made but must not show (their cards were never sent). Only the actor's own, still open. */
+export async function discardProposals(actor: Actor, ids: string[], now: Date): Promise<void> {
+  assertCan(actor, "create");
+  if (ids.length === 0) return;
+  await db()
+    .update(schema.bookingProposal)
+    .set({ expiresAt: now })
+    .where(and(ownedBy({ ownerId: schema.bookingProposal.customerId }, actor), inArray(schema.bookingProposal.id, ids), isNull(schema.bookingProposal.usedAt), gt(schema.bookingProposal.expiresAt, now)));
 }
 
 /** "Not now": the customer closes a card. Idempotent; only the owner's open proposal changes. */
