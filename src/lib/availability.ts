@@ -2,7 +2,7 @@ import "server-only";
 import { TZDate } from "@date-fns/tz";
 import { sql } from "drizzle-orm";
 import { z } from "zod";
-import { db } from "@/lib/db";
+import { type Db, db } from "@/lib/db";
 import { BadRequestError } from "@/lib/errors";
 
 /** Starts are offered on this grid, measured from each working-interval start. */
@@ -125,7 +125,10 @@ export function availableSlots(input: AvailabilityInput): Slot[] {
   return unique.map((start) => ({ start }));
 }
 
-type Loaded = {
+/** The pool or a transaction: `createBooking` re-reads availability on its own transaction's connection. */
+type Executor = Pick<Db, "execute">;
+
+export type Loaded = {
   profile: AvailabilityProfile;
   service: AvailabilityService;
   hours: WeeklyHour[];
@@ -137,8 +140,14 @@ type Loaded = {
  * Profile, service, hours, overrides, and confirmed blocked ranges in one statement.
  * Returns null when that provider doesn't offer that service.
  */
-export async function loadAvailability(providerId: string, serviceId: string, from: Date, to: Date): Promise<Loaded | null> {
-  return loadWhere(sql`p.user_id = ${providerId}`, serviceId, from, to);
+export async function loadAvailability(
+  providerId: string,
+  serviceId: string,
+  from: Date,
+  to: Date,
+  executor: Executor = db(),
+): Promise<Loaded | null> {
+  return loadWhere(sql`p.user_id = ${providerId}`, serviceId, from, to, executor);
 }
 
 /** Same as `loadAvailability`, looked up by the public slug so the slots route is one round trip. */
@@ -146,8 +155,14 @@ export async function loadAvailabilityBySlug(slug: string, serviceId: string, fr
   return loadWhere(sql`p.slug = ${slug}`, serviceId, from, to);
 }
 
-async function loadWhere(where: ReturnType<typeof sql>, serviceId: string, from: Date, to: Date): Promise<Loaded | null> {
-  const rows = await db().execute<LoadRow>(sql`
+async function loadWhere(
+  where: ReturnType<typeof sql>,
+  serviceId: string,
+  from: Date,
+  to: Date,
+  executor: Executor = db(),
+): Promise<Loaded | null> {
+  const rows = await executor.execute<LoadRow>(sql`
     select
       p.time_zone,
       p.accepting,
