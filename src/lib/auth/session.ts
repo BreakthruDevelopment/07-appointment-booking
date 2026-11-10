@@ -21,9 +21,10 @@ export const getCurrentUser = cache(async (): Promise<CurrentUser | null> => {
 });
 
 /** For pages: send signed-out visitors to the sign-in page. */
-export async function requireUserOrRedirect(): Promise<CurrentUser> {
+export async function requireUserOrRedirect(next?: string): Promise<CurrentUser> {
   const user = await getCurrentUser();
-  if (!user) redirect("/sign-in");
+  // `next` is only ever a literal path from the calling page; the sign-in page validates it again with safeNext.
+  if (!user) redirect(next ? `/sign-in?next=${encodeURIComponent(next)}` : "/sign-in");
   return user;
 }
 

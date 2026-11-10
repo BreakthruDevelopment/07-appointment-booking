@@ -1,7 +1,8 @@
 import type { Metadata } from "next";
 import { notFound } from "next/navigation";
 import { SlotPicker } from "@/components/booking/slot-picker";
-import { PageIntro, Panel } from "@/components/ui";
+import Link from "next/link";
+import { PageIntro, Panel, buttonOutlineAccent } from "@/components/ui";
 import { getCurrentUser } from "@/lib/auth/session";
 import { getOwnProfileOrNull, getPublicProvider } from "@/lib/provider";
 
@@ -37,6 +38,18 @@ export default async function ProviderBookingPage({ params }: Props) {
       {provider.bio && (
         <Panel title="About">
           <p className="whitespace-pre-line break-words">{provider.bio}</p>
+        </Panel>
+      )}
+      {own?.slug !== provider.slug && (
+        <Panel title="Rather ask?">
+          <div className="flex flex-wrap items-center gap-3">
+            <p className="min-w-0 flex-1 basis-60 text-sm text-muted">
+              Tell the assistant what suits you, like &ldquo;anything Tuesday after 3?&rdquo;. It suggests a time and you confirm it. {user ? "" : "You need to sign in to chat."}
+            </p>
+            <Link href={`/p/${provider.slug}/chat`} className={buttonOutlineAccent} data-action="ask-assistant">
+              Ask the assistant
+            </Link>
+          </div>
         </Panel>
       )}
       <Panel title="Book an appointment">

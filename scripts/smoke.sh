@@ -296,4 +296,43 @@ echo "$signin" | grep -q '\\"next\\":\\"/dashboard\\"' || fail "sign-in should f
 echo "$signin" | grep -q '\\"next\\":\\"//evil' && fail "sign-in passed an off-site next target to the form"
 pass "sign-in ignores an off-site next target"
 
+for evil in '/.//evil.example' '/..//evil.example' '/%2e%2e//evil.example' '/a/../b'; do
+  signin=$(curl -fsS "$BASE_URL/sign-in?next=$evil") || fail "sign-in with next=$evil did not render"
+  echo "$signin" | grep -q '\\"next\\":\\"/dashboard\\"' || fail "sign-in should refuse next=$evil"
+done
+pass "sign-in refuses dot-segment and hidden double-slash next targets"
+
+# ---------------------------------------------------------------------------
+# Chat page and "Ask the assistant" link (7.4). The conversation itself loads in the browser through the chat route,
+# so here the server-rendered shell and who may see it are checked.
+# ---------------------------------------------------------------------------
+echo "$public_page" | grep -q "data-action=\"ask-assistant\"" || fail "booking page is missing the Ask the assistant link"
+echo "$public_page" | grep -q "href=\"/p/$SLUG/chat\"" || fail "Ask the assistant should link to the chat page"
+own_page=$(page "$JAR_A" "/p/$SLUG")
+if echo "$own_page" | grep -q 'data-action="ask-assistant"'; then fail "a provider should not be offered the assistant on their own page"; fi
+pass "booking page links to the assistant (not for the owner)"
+
+headers=$(curl -s -o /dev/null -D - "$BASE_URL/p/$SLUG/chat")
+echo "$headers" | head -1 | grep -q '307' || fail "signed-out chat page should redirect (307)"
+echo "$headers" | grep -i '^location:' | grep -q "next=%2Fp%2F$SLUG%2Fchat" || fail "signed-out chat page should send the visitor to sign in and back: $headers"
+code=$(curl -s -o /dev/null -w '%{http_code}' -b "$JAR_D" "$BASE_URL/p/missing-studio/chat")
+[ "$code" = "404" ] || fail "chat page for an unknown provider should be 404, got $code"
+code=$(curl -s -o /dev/null -w '%{http_code}' -b "$JAR_D" "$BASE_URL/p/NOT_A_SLUG/chat")
+[ "$code" = "404" ] || fail "chat page for a malformed slug should be 404, got $code"
+chat_page=$(page "$JAR_D" "/p/$SLUG/chat") || fail "chat page did not render for a signed-in customer"
+echo "$chat_page" | grep -q 'data-chat-panel' || fail "chat page is missing the panel"
+echo "$chat_page" | grep -q "data-chat-slug=\"$SLUG\"" || fail "chat panel should name the provider slug"
+echo "$chat_page" | grep -q 'data-chat-input' || fail "chat panel is missing the message box"
+echo "$chat_page" | grep -qi 'maxlength="500"' || fail "chat message box should cap at 500 characters"
+echo "$chat_page" | grep -q 'data-chat-count' || fail "chat panel is missing the character counter"
+echo "$chat_page" | grep -q 'data-chat-loading' || fail "chat panel should start in its loading state"
+if echo "$chat_page" | grep -q 'data-confirm-card'; then fail "the server-rendered chat shell must not contain a confirm card"; fi
+own_chat=$(page "$JAR_A" "/p/$SLUG/chat") || fail "chat page did not render for the owner"
+echo "$own_chat" | grep -q 'data-chat-own' || fail "the owner should see the own-page note"
+if echo "$own_chat" | grep -q 'data-chat-panel'; then fail "the owner should not get a chat panel"; fi
+pass "chat page: sign-in required, 404s, panel shell, owner note"
+
+echo "$mine_d" | grep -q 'data-moment="cancel-by"' || fail "my bookings should show the cancel-by time (rendered through LocalMoment)"
+pass "cancel-by time is rendered for the viewer's zone"
+
 echo "SMOKE PASS"
