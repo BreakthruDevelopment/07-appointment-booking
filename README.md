@@ -1,15 +1,86 @@
-# 30 Apps Template
+# Appointment Booking
 
-The starting point for every app in Breakthru Ventures' **30 apps in 30 days** portfolio. Each app is a
-responsive web app with a Postgres database, sign-in with roles, one AI feature, and a single container
-image that deploys to AWS, Azure, Google Cloud or Oracle Cloud.
+> Publish services and weekly availability, let customers book open times from their phones without double-booking, and converse with an AI assistant that proposes verified slots for one-tap confirmation.
 
-## What this app does
+**Live:** https://app7.breakthruventures.ai · **Runs on:** Google Cloud (Cloud Run, us-central1) · Part of
+[30 apps in 30 days](https://github.com/BreakthruDevelopment/ai-dev-os)
 
-_Each app replaces this section: the customer problem, who uses it, and what the AI feature does._
+## What it does
 
-The template ships an example "items" feature: users manage their own items, admins see everyone's, and
-an AI summary describes the list.
+Salons, clinics, tutors, and solo consultants need a clean, self-hosted Calendly / Square Appointments alternative:
+publish services, define working hours, share booking links, and eliminate double-booking across time zones.
+
+- **Public booking page (`/p/[slug]`):** Anyone can browse a provider's active services, select dates on a responsive day strip, view available times in their own local time zone, and sign in to confirm a slot.
+- **Customer self-service (`/bookings`):** Customers view upcoming and past appointments, download standard `.ics` calendar invites, cancel appointments within notice windows, or chat with the provider's AI assistant.
+- **Provider management (`/provider` & `/provider/calendar`):** Any user can toggle "Accept bookings" to configure their booking profile, public slug, IANA time zone, buffer times, minimum notice, booking horizon, weekly working hours, and single-day date overrides. Providers view their agenda by day, cancel appointments, and subscribe to their private calendar feed.
+- **Admin oversight (`/admin`):** Admins monitor platform health and aggregate metric counts only (provider count, active services, bookings by status, chat turns, and model tool calls vs caps). Admins cannot view client notes or manage appointments for other users.
+- **AI booking assistant (`/p/[slug]/chat`):** Customers converse with an AI assistant that queries live availability and generates structured booking proposals. Appointments are never finalized until the customer explicitly taps Confirm.
+
+### Provider as profile, not a role
+
+In this system, **provider is a profile, not a separate Better Auth role**. Any authenticated user can set up a provider profile and publish a booking page. Data ownership cleanly isolates responsibilities:
+- A user owns their customer bookings.
+- A provider profile owns their services, working hours, date overrides, and the bookings scheduled against them.
+- A booking is strictly visible to exactly two parties: its customer and its provider.
+
+Adding a third role would introduce redundant role checks without security benefit. Better Auth maintains two system roles: `user` and `admin` (where `admin` sees counts only).
+
+## Availability engine and DST
+
+Availability calculation is implemented as a deterministic pure function (`availableSlots` in `src/lib/availability.ts`). Given a provider profile, service configuration, weekly working hours, date overrides, confirmed busy ranges, query window (`from`/`to`), and the current instant `now`, it computes bookable slots:
+
+1. **Time zones & wall-clock intervals:** Providers specify an IANA time zone (validated against `Intl.supportedValuesOf("timeZone")` and Postgres `pg_timezone_names`). Weekly working hours and date overrides are defined in local wall-clock minutes (0–1,440). Intervals are converted to exact UTC instants using `@date-fns/tz` (`TZDate`). The API communicates in UTC ISO strings; client interfaces render times converted to the viewer's local time zone while explicitly naming the provider's zone ("Times shown in your time zone, America/Denver").
+2. **Daylight Saving Time (DST):**
+   - **Spring-forward:** Local start times falling into skipped clock transitions are omitted.
+   - **Fall-back:** Ambiguous local times during clock rollbacks consistently resolve to the first occurrence.
+   - **Absolute duration:** Slots represent `[start, start + duration)` in elapsed absolute minutes; a 60-minute appointment spanning a DST change remains exactly 60 minutes long.
+   - Handled and tested against critical boundaries (America/New_York, Europe/London, Australia/Lord_Howe 30-minute shifts, and Asia/Kolkata).
+3. **Candidate generation & overrides:** Working hours generate candidate start intervals spaced at 15-minute steps (`slot_step`). Specific date overrides replace weekly hours or mark dates closed.
+4. **Buffer times & busy ranges:** Services configure optional `buffer_before_min` and `buffer_after_min` (0–60 min). A candidate slot is rejected if `[start - buffer_before, end + buffer_after)` intersects the blocked range of any confirmed appointment.
+5. **Notice & horizon limits:** Slots must satisfy `start >= now + min_notice_minutes` and `start < now + horizon_days`. Availability queries span at most 14 days and cap output at 200 slots.
+
+## Concurrency and double-booking prevention
+
+Double-booking prevention is enforced at the database layer rather than relying on brittle in-memory locks:
+
+- **Postgres exclusion constraints:** The `booking` table maintains a PostgreSQL `tstzrange` column named `blocked` (`[starts_at - buffer_before, ends_at + buffer_after)`). A GiST exclusion constraint prevents any overlapping confirmed appointments:
+  ```sql
+  EXCLUDE USING gist (provider_id WITH =, blocked WITH &&) WHERE (status = 'confirmed')
+  ```
+  A second exclusion constraint on `(customer_id, slot)` ensures a single customer cannot hold concurrent appointments across any providers.
+- **btree_gist extension:** Database migration enables `create extension if not exists btree_gist`.
+- **In-transaction validation:** When `createBooking` executes, it re-verifies availability inside the database transaction (service active, provider accepting bookings, provider != customer, working hours, notice, horizon, and step alignment).
+- **Graceful conflict handling:** Concurrency collisions trigger Postgres error `23P01` (exclusion violation), translated into HTTP `409 Conflict` ("That time was just taken") and returning fresh availability options.
+- **Fair-use limits:** Max 3 future appointments per customer per provider (10 overall), and at most 10 booking attempts per hour per user.
+
+## Calendar export and subscribe feed
+
+- **Single booking `.ics` (`GET /api/bookings/[id]/ics`):** Customers and providers can download an RFC 5545 compliant `.ics` calendar event. Built with strict CRLF line endings, 75-octet line folding, proper character escaping (`\`, `;`, `,`, newlines), unique `UID:<id>@app7.breakthruventures.ai`, UTC `DTSTART`/`DTEND`, and incremented `SEQUENCE` with `STATUS:CANCELLED` on cancellation.
+- **Provider subscribe feed (`GET /api/calendar/[token].ics`):** Providers can subscribe to their calendar feed in Apple Calendar, Google Calendar, or Outlook. The private URL includes a 32-byte cryptographically secure random token (base64url) stored as a SHA-256 hash in `calendar_feed`. Tokens can be rotated on demand. The feed serves confirmed appointments spanning 30 days prior through 60 days ahead (and cancellations from the past 7 days). To safeguard customer privacy, event summaries display the service title and the customer's **first name only** (no emails or phone numbers).
+- **Polling expectations:** Calendar clients refresh feeds on external schedules (Google Calendar often caches feeds for several hours); the provider dashboard explicitly notes this behavior.
+
+## Google Calendar two-way sync (later option & 7-day testing caveat)
+
+Two-way Google Calendar synchronization is architecturally designed for future enablement:
+- **Design:** Authenticates via Better Auth Google social link (`linkSocial`) requesting `access_type=offline` and scopes `calendar.events.owned` and `calendar.freebusy`. Refresh tokens are secured using envelope encryption (AES-256-GCM with AAD bound to the user id). The availability engine queries Google FreeBusy for the upcoming 14 days (cached 5 minutes), writes booked appointments to Google Calendar, and removes cancelled ones.
+- **The 7-Day testing caveat:** In Google Cloud Console, OAuth consent screens remaining in "Testing" status issue refresh tokens that **expire after 7 days**. As a result, providers would be forced to reconnect their Google account weekly. Promoting the OAuth app to "Production" with sensitive calendar scopes requires Google's formal app verification process. For this reason, core appointment booking ships with private `.ics` subscription feeds, leaving direct Google Calendar OAuth sync as an optional future enhancement.
+
+## The AI booking assistant
+
+Customers can schedule or cancel appointments conversationally through a chat assistant on `/p/[slug]/chat`.
+
+### The propose-and-confirm design invariant
+
+To prevent hallucinated bookings or accidental commitments, the assistant operates under a strict security invariant: **the model has no write tools**.
+
+- **Read & propose tools only:** The assistant only accesses four tools:
+  - `find_open_slots`: Fetches verified available slots (`<= 12`) for a service over a given date range.
+  - `propose_booking`: Writes a short-lived `booking_proposal` record (expires in 10 minutes) and returns proposal metadata.
+  - `list_my_bookings`: Lists the signed-in customer's upcoming bookings with this provider.
+  - `propose_cancel`: Validates appointment ownership and generates a cancellation proposal.
+- **Human confirmation:** The model cannot create or cancel bookings directly. Instead, calling `propose_*` renders a structured **Confirm Card** in the chat UI based strictly on verified `booking_proposal` database records—never from raw assistant text. The appointment is finalized only when the user explicitly clicks the **Confirm** button, dispatching a standard `POST /api/bookings { proposalId }` request through the exact same transactional validation pipeline.
+- **Closed tool handlers:** Tool executions bind `providerId` and `actor` directly in server closures, completely preventing model-directed parameter tampering. All IDs exposed to the model are ephemeral, opaque turn tokens (`S1..S20`, `A1..A12`, `B1..B10`).
+- **Safety guardrails:** Enforces a maximum of 4 model steps per turn, at most 3 tool calls per step, a 24-second timeout per turn, tool result serialization capped at 2 KB, user input capped at 500 characters, and 20 turns per user per hour. Untrusted customer messages and tool outputs are treated strictly as data.
 
 ## Architecture
 
@@ -17,121 +88,95 @@ an AI summary describes the list.
 Browser (desktop and phone)
    │ HTTPS + session cookie
    ▼
-Next.js container ── pages, server actions, route handlers (/api/*)
-   │                  auth + RBAC, zod validation, AI gateway, JSON logs, /api/health
-   ├──► Postgres (Drizzle; pgvector available for RAG)
-   └──► Model API (Gemini free tier, Claude optional, or recorded demo answers)
+Cloud Run container (Next.js App Router) ── pages, server actions, route handlers (/api/*)
+   │                                        auth + RBAC, zod validation, AI gateway, JSON logs, /api/health
+   ├──► Postgres 17 (Drizzle + btree_gist) on e2-micro VM
+   └──► Gemini API (gemini-flash-latest, free tier, or recorded demo answers)
 ```
 
-| Concern | Where |
+| Concern | Implementation |
 | --- | --- |
-| Config, validated at startup | `src/lib/env.ts` |
-| Schema and migrations | `src/lib/db/schema.ts`, `drizzle/` |
-| Sign-in, sessions, roles | `src/lib/auth/` (Better Auth + admin plugin) |
-| Access rules | `src/lib/auth/rbac.ts`, enforced in every data function |
-| AI gateway | `src/lib/ai/` — input cap, JSON schema validation, demo fallback |
-| Health check | `GET /api/health` (503 if the database is down) |
+| Runtime environment | Google Cloud Run, 1 vCPU / 512 MiB, `cpu_idle = true` (30 s timeout) |
+| Database & constraints | PostgreSQL 17 on e2-micro VM, Drizzle ORM, `btree_gist` exclusion constraints |
+| Authentication & roles | Better Auth with Admin plugin (`user`, `admin`); provider profile |
+| Authorization & security | Server-side authorization in all data functions; tenant isolation |
+| AI tool loop | Multi-step tool-use loop with `generate()`, Gemini free tier & demo fallback |
+| Calendar export & feed | RFC 5545 `.ics` generator, SHA-256 hashed feed tokens |
+| Health probe | `GET /api/health` (returns 503 if database check fails) |
 
-## Auth and roles
+## Security
 
-Two roles, `user` and `admin`, via Better Auth's admin plugin. **Admins manage accounts but never act as users:**
-`src/lib/auth/permissions.ts` gives `admin` create, list, get, update, set-role, ban and delete on users plus
-session revoke/delete. It withholds `impersonate`, `impersonate-admins`, `set-password` and `set-email`
-(Better Auth's default admin role includes them) and session `list`, which would expose other users' raw
-session tokens, IP addresses and user agents. `/admin/impersonate-user`, `/admin/stop-impersonating`,
-`/admin/set-user-password` and `/admin/list-user-sessions` are also in `disabledPaths`, so they return 404 even
-if a role is widened later. `update` lets an admin change another user's name and image (intended).
-Tests: `test/admin-permissions.integration.test.ts`. Don't add these permissions back; apps promise that admins
-see counts only.
+- **Server-side authorization:** Every route handler and server action enforces session validation (`requireUser()` / `requireRole()`). Data operations call `assertCan()` and filter by owner.
+- **Tenant isolation:** Appointments are queryable only by the customer (`customer_id = actor.id`) or the provider (`provider_id = actor.id`). All attempts to access foreign bookings return `404 Not Found` for both users and administrators.
+- **Admin privacy:** Administrators view aggregate platform counters only (provider totals, service counts, booking status distributions, and AI chat usage vs quotas). Admins cannot inspect appointment notes or impersonate users.
+- **Feed token protection:** Calendar feed tokens are 32-byte base64url random strings. Only their SHA-256 digests are stored in the database. Tokens are displayed once upon creation and can be rotated at any time.
+- **Input sanitization & CSRF:** All payloads are validated using Zod schemas at boundary routes. Mutating endpoints enforce origin validation (`requireSameOrigin`) and reject bodies exceeding 16 KB.
+
+## Free-tier budget
+
+| Resource | Control / Invariant | Worst case per month |
+| --- | --- | --- |
+| **Cloud Run** (2M requests, 180k vCPU-s, 360k GiB-s free) | Max 1 instance, CPU idle between requests; chat turn bounded at <=24 s | Well within free tier |
+| **e2-micro Postgres** (30 GB disk, 60 shared connections) | Caps: <=20 services, <=50 hour intervals, <=60 overrides per provider | Lightweight (megabytes) |
+| **Gemini API** | Max 4 model steps per turn; 20 turns/user/hr; `CHAT_DAILY_CAP` 400 steps app-wide | Zero-cost free tier |
 
 ## Run locally
 
 ```bash
-cp .env.example .env.local          # then set BETTER_AUTH_SECRET (openssl rand -base64 32)
+cp .env.example .env.local          # set BETTER_AUTH_SECRET (openssl rand -base64 32)
 docker compose up -d db
 pnpm install
 pnpm db:migrate
-pnpm dev                             # http://localhost:3000
+pnpm dev                            # http://localhost:3000
 ```
 
-To make yourself an admin: sign up, then `SEED_ADMIN_EMAIL=you@example.com SEED_ADMIN_PASSWORD=... pnpm db:seed`
-while the app is running.
+### Seeding demo data
 
-## Design system
+To load the seed admin and the "Demo Studio" provider with services, weekly availability, and sample bookings across a daylight saving week:
+```bash
+SEED_ADMIN_EMAIL=admin@example.com SEED_ADMIN_PASSWORD=admin-password-123 pnpm db:seed
+```
 
-Every app shares the Breakthru look (guide and concept: `ai-dev-os/design/`). Tokens live in `src/app/globals.css`
-(light and dark; use `bg-surface`, `text-muted`, `border-border`, `bg-accent` and the status tokens, never raw colors).
-Fonts load through `next/font/google` in `src/app/layout.tsx`: Newsreader (`font-display`), Public Sans (`font-sans`),
-IBM Plex Mono (`font-mono`). Set the app's name once in `src/lib/app-config.ts` (`APP_TITLE`, or the `APP_NAME` variable).
+### Environment variables
 
-| Component | Location | Use |
-| --- | --- | --- |
-| `AppShell` | `src/components/app-shell.tsx` | Header (logo, app name, nav, sign in or user and sign out) and footer; wraps every page in the root layout |
-| `PageIntro` | `src/components/ui/` | Eyebrow, Newsreader headline, one-line description, actions |
-| `StatTile`, `StatGrid` | `src/components/ui/` | A number and a label; tiles stack at 375px |
-| `FilterBar` | `src/components/ui/` | Search, select filters, sort and table/cards toggle as a GET form (state in the URL) |
-| `StatusBadge` | `src/components/ui/` | Live, building, blocked, not started (neutral), healthy, degraded, down |
-| `DataList` | `src/components/ui/` | Table from 640px, cards below |
-| `Panel` | `src/components/ui/` | Titled panel; `collapsible` adds a "Show all" toggle (small client component) |
-| `DemoBadge` | `src/components/ui/` | "Demo data" label for seeded or demo content |
-
-The header links come from `NAV_LINKS` in `src/lib/app-config.ts`; each app must edit that list (the template's
-`/dashboard` and `/admin` links break if the app deletes those pages).
-
-Shared button and field classes are in `src/components/ui/styles.ts` (44px minimum height). Don't add `loading.tsx` or
-`<Suspense>` above a page that calls `requireRoleOrRedirect()` or `notFound()`.
+Names only (never commit secrets):
+| Variable | Purpose |
+| --- | --- |
+| `APP_NAME` | Application name for branding and headers |
+| `APP_URL` | Base public URL (e.g. `https://app7.breakthruventures.ai`) |
+| `DATABASE_URL` | PostgreSQL connection string |
+| `BETTER_AUTH_SECRET` | 32+ character random secret for session encryption |
+| `AI_PROVIDER` | `gemini` (live), `anthropic`, or `demo` (recorded offline answers) |
+| `GEMINI_API_KEY` | Google Gemini API key |
+| `AI_FALLBACK_TO_DEMO` | Fallback to recorded demo answers on quota or network errors (`true`/`false`) |
+| `LOG_LEVEL` | Logging level (`debug`, `info`, `warn`, `error`) |
+| `MIGRATE_ON_START` | Auto-apply pending migrations on container start (`true`/`false`) |
 
 ## Checks
 
 ```bash
-pnpm lint && pnpm typecheck && pnpm test   # unit tests
-TEST_DATABASE_URL=postgres://... pnpm test # plus data-layer tests against real Postgres
-pnpm build && pnpm smoke                   # end-to-end smoke test against a running app
+pnpm lint && pnpm typecheck && pnpm test   # unit tests and type checks
+TEST_DATABASE_URL=postgres://... pnpm test # data-layer tests with PostgreSQL exclusion constraints
+pnpm build && pnpm smoke                   # full build and end-to-end smoke test
 ```
 
-CI runs all of these plus both container builds on every pull request.
+## Deploy it yourself
 
-## Deploy
+Deployments run via Docker containers to Cloud Run with Terraform managed in [30-apps-infra](https://github.com/BreakthruDevelopment/30-apps-infra). Multi-arch container images publish to GitHub Container Registry on pushes to `main`. When `MIGRATE_ON_START=true`, database migrations run during startup under a PostgreSQL advisory lock.
 
-Every push to `main` publishes a multi-arch image (x86 and ARM) to GitHub Container Registry as
-`ghcr.io/breakthrudevelopment/<repo>:sha-<commit>`. [30-apps-infra](https://github.com/BreakthruDevelopment/30-apps-infra)
-deploys those tags to AWS, Azure, Google Cloud and Oracle Cloud with Terraform; this repo holds no cloud credentials.
+## 2-minute demo script
 
-With `MIGRATE_ON_START=true` the server applies pending migrations before taking traffic, holding a Postgres
-advisory lock so instances starting together can't race. `pnpm db:migrate` does the same by hand.
-
-## Using the AI feature
-
-| `AI_PROVIDER` | Behavior |
-| --- | --- |
-| `demo` (default) | Recorded answers from `src/lib/ai/demo.ts`; no key, no network |
-| `gemini` | Google Gemini API (`GEMINI_API_KEY`, free tier) |
-| `anthropic` | Claude (`ANTHROPIC_API_KEY`) |
-
-With `AI_FALLBACK_TO_DEMO=true`, a quota error or outage serves the recorded answer and the UI says so.
-
-### Images: `generate({ images })`
-
-`generate()` takes an optional `images: { mimeType, data }[]` (base64 of the raw bytes, no `data:` prefix). Limits
-(`input_rejected`, checked before any network call, in every mode): at most 4 images, 5 MB each decoded
-(`MAX_IMAGE_BYTES`), 10 MB in total, MIME `image/jpeg`, `image/png`, `image/webp`, `image/heic` or `image/heif`, valid
-base64. Gemini gets one `inlineData` part per image before the text part; Anthropic gets `image` blocks and rejects
-HEIC/HEIF. `demo` answers from the task's fixture and ignores the images. Logs carry the image count and total bytes,
-never the data. Treat text inside an image as data in your system prompt, exactly like user text.
-
-### Embeddings: `embed()`
-
-`embed({ task, texts, kind: "document" | "query" })` from `src/lib/ai` returns
-`{ vectors, provider, model, dims, demo, latencyMs }`: 768-dim, L2-normalized vectors (fits pgvector's 2,000-dim
-HNSW limit). Limits: 32 texts per call, 8,000 characters each, 64,000 in total (`input_rejected`).
-
-- `gemini` calls `batchEmbedContents` with `AI_EMBED_MODEL` (default `gemini-embedding-2`, which takes the task in
-  the text: `task: search result | query: …` / `title: none | text: …`; set `gemini-embedding-001` to use `taskType`).
-  Changing the model changes the vector space: stored vectors must be re-embedded.
-- `demo` (and a missing key, or a provider failure while `AI_FALLBACK_TO_DEMO=true`) uses deterministic hashed
-  bag-of-words vectors, model `demo-hash-768`: lexical but meaningful, offline.
-- `AI_PROVIDER=anthropic` has no embeddings API, so it embeds with Gemini if `GEMINI_API_KEY` is set, else demo.
-- Always store `model` with each vector and only compare vectors with the same model; a demo fallback reports
-  `demo: true` and the demo model name so vector spaces are never mixed.
-- `AI_TIMEOUT_MS` (default 20000, max 22000) bounds every provider call, `generate()` and `embed()` alike.
-- Logs carry task, provider, model, count and latency, never the text.
+1. **Browse provider page (`/p/demo-studio`):**
+   Open the public booking page for "Demo Studio". Point out the services (e.g., Haircut, Styling) and the 7-day slot picker showing open times in your local time zone ("Times shown in your time zone, America/Denver").
+2. **Chat with the booking assistant (`/p/demo-studio/chat`):**
+   Click **Ask the assistant**. Sign in as customer `customer-a@example.com`. Type: *"Can I get a haircut next Tuesday after 3pm?"*
+   *Proves:* The assistant invokes `find_open_slots` and `propose_booking` to find a matching Tuesday slot without inventing times.
+3. **Confirm the booking proposal:**
+   Notice the assistant does not book directly, but presents a structured **Confirm Card** displaying the service, duration, and local time. Tap **Confirm**.
+   *Proves:* Bookings require human consent. The UI redirects to `/bookings` displaying the confirmed appointment with an option to download the `.ics` calendar file.
+4. **Demonstrate double-booking rejection (Concurrency & exclusion constraint):**
+   Open an incognito window, navigate to `/p/demo-studio`, and sign in as customer `customer-b@example.com`. Attempt to book the exact same Tuesday slot.
+   *Proves:* The database exclusion constraint blocks the insertion with Postgres error `23P01`. The server returns HTTP `409 Conflict` ("That time was just taken") and displays updated alternative slots.
+5. **Verify provider agenda and private subscribe feed (`/provider/calendar`):**
+   Sign in as provider `provider@example.com` and open the agenda view at `/provider/calendar`. The Tuesday appointment appears on the schedule. Copy the calendar subscribe feed link from `/provider` and import it into a calendar app (or fetch `/api/calendar/[token].ics`).
+   *Proves:* The RFC 5545 calendar feed reflects the newly confirmed booking showing the service name and customer's first name only, preserving privacy.
