@@ -26,6 +26,8 @@ const schema = z.object({
   AI_EMBED_MODEL: z.string().optional(),
   // Provider call timeout. 20 s keeps AI calls inside Lambda's 29 s limit (route maxDuration is 25 s).
   AI_TIMEOUT_MS: z.coerce.number().int().positive().max(22000).default(20000),
+  // App-wide model steps the booking assistant may use per UTC day (a turn reserves its 4 steps up front).
+  CHAT_DAILY_CAP: z.coerce.number().int().min(1).max(100000).default(400),
   LOG_LEVEL: z.enum(["debug", "info", "warn", "error"]).default("info"),
 });
 

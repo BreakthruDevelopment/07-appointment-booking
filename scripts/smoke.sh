@@ -203,4 +203,48 @@ code=$(curl -s -o /dev/null -w '%{http_code}' "$BASE_URL$FEED_PATH")
 [ "$code" = "404" ] || fail "the old feed URL should stop working after a rotate, got $code"
 pass "rotating the feed kills the old URL"
 
+# ---------------------------------------------------------------------------
+# Booking assistant (CI runs AI_PROVIDER=demo, so this is the recorded script through the real tool handlers).
+# It only ever PROPOSES; the customer's confirm books, once, and only for the customer it was made for.
+# ---------------------------------------------------------------------------
+code=$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'content-type: application/json' -H "origin: $BASE_URL" \
+  -d '{"message":"anything Tuesday after 3?"}' "$BASE_URL/api/chat/$SLUG")
+[ "$code" = "401" ] || fail "anonymous chat should be 401, got $code"
+code=$(curl -s -o /dev/null -w '%{http_code}' -X POST -b "$JAR_D" -H 'content-type: application/json' -H 'origin: https://evil.example' \
+  -d '{"message":"hi"}' "$BASE_URL/api/chat/$SLUG")
+[ "$code" = "403" ] || fail "cross-origin chat should be 403, got $code"
+code=$(curl -s -o /dev/null -w '%{http_code}' -X POST -b "$JAR_A" -H 'content-type: application/json' -H "origin: $BASE_URL" \
+  -d '{"message":"hi"}' "$BASE_URL/api/chat/$SLUG")
+[ "$code" = "400" ] || fail "a provider chatting with their own page should be 400, got $code"
+pass "chat refuses anonymous, cross-origin and own-page callers"
+
+chat=$(curl -fsS -b "$JAR_D" -H 'content-type: application/json' -H "origin: $BASE_URL" \
+  -d '{"message":"anything Tuesday after 3?","timeZone":"America/Denver"}' "$BASE_URL/api/chat/$SLUG") || fail "assistant turn failed"
+PROPOSAL_ID=$(printf '%s' "$chat" | json_field proposal.id) || fail "the assistant proposed nothing: $chat"
+printf '%s' "$chat" | json_field proposal.status | grep -qx open || fail "proposal should be open: $chat"
+printf '%s' "$chat" | json_field proposal.startsAt >/dev/null || fail "proposal card has no time: $chat"
+pass "the assistant proposed a time (nothing booked yet)"
+
+code=$(curl -s -o /dev/null -w '%{http_code}' -X POST -b "$JAR_C" -H 'content-type: application/json' -H "origin: $BASE_URL" \
+  -d "{\"proposalId\":\"$PROPOSAL_ID\"}" "$BASE_URL/api/bookings")
+[ "$code" = "404" ] || fail "another customer confirming D's proposal should be 404, got $code"
+code=$(curl -s -o /dev/null -w '%{http_code}' -X POST -b "$JAR_D" -H 'content-type: application/json' -H "origin: $BASE_URL" \
+  -d "{\"proposalId\":\"$PROPOSAL_ID\",\"startsAt\":\"2000-01-01T00:00:00Z\"}" "$BASE_URL/api/bookings")
+[ "$code" = "400" ] || fail "a confirm that carries its own time should be 400, got $code"
+pass "only the owner can confirm, and a confirm can't carry its own time"
+
+confirmed=$(curl -fsS -b "$JAR_D" -H 'content-type: application/json' -H "origin: $BASE_URL" \
+  -d "{\"proposalId\":\"$PROPOSAL_ID\"}" "$BASE_URL/api/bookings") || fail "owner could not confirm the proposal"
+printf '%s' "$confirmed" | json_field booking.status | grep -qx confirmed || fail "confirm should book: $confirmed"
+code=$(curl -s -o /dev/null -w '%{http_code}' -X POST -b "$JAR_D" -H 'content-type: application/json' -H "origin: $BASE_URL" \
+  -d "{\"proposalId\":\"$PROPOSAL_ID\"}" "$BASE_URL/api/bookings")
+[ "$code" = "409" ] || fail "a second confirm of the same proposal should be 409, got $code"
+pass "confirm books once, then the proposal is spent"
+
+history=$(curl -fsS -b "$JAR_D" "$BASE_URL/api/chat/$SLUG") || fail "chat history failed"
+printf '%s' "$history" | json_field messages.1.proposal.status | grep -qx used || fail "history should show the card as used: $history"
+history_c=$(curl -fsS -b "$JAR_C" "$BASE_URL/api/chat/$SLUG") || fail "customer C history failed"
+printf '%s' "$history_c" | grep -q "$PROPOSAL_ID" && fail "another customer's history leaked the proposal"
+pass "chat history is private and shows the spent card"
+
 echo "SMOKE PASS"
