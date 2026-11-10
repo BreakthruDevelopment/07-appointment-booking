@@ -421,6 +421,33 @@ describe.skipIf(!url)("booking assistant (Postgres)", () => {
       await expect(say(w.bob, "again")).rejects.toMatchObject({ status: 429 });
     });
 
+    it("a live failure on a follow-up turn runs no demo script: the customer's open card stays open and nothing new is written", async () => {
+      setAi("scripted", { AI_FALLBACK_TO_DEMO: "true" });
+      const { runChatTurn } = await import("@/lib/assistant/chat");
+      // Turn 1: the model finds a slot and proposes it. The card is open.
+      installScript((req, n) =>
+        n === 1 ? turn(call("find_open_slots", { service: "S1", fromDate: "2026-06-02", toDate: "2026-06-02" })) : n === 2 ? turn(call("propose_booking", { slotId: "A1" })) : turn(respond({ reply: "Tap Confirm.", proposalId: proposalIdOf(req.history) })),
+      );
+      const first = await runChatTurn(w.ann, w.slug, { message: "book tuesday", timeZone: TZ }, tick());
+      expect(first.proposal).toMatchObject({ status: "open" });
+      const openId = first.proposal!.id;
+      // Turn 2: the provider fails before any tool call, so generate() would replay the demo script (find + propose).
+      installScript(() => {
+        throw Object.assign(new Error("boom"), { name: "AiError", kind: "provider" });
+      });
+      const second = await runChatTurn(w.ann, w.slug, { message: "anything wednesday?", timeZone: TZ }, tick());
+      expect(second).toMatchObject({ fallback: true, demo: false, proposal: null });
+      expect(second.messages[1].text).toBe("I couldn't finish that; here are the open times on the page.");
+      const rows = await sql`select id, used_at, expires_at from booking_proposal where customer_id = ${w.ann.id}`;
+      expect(rows).toHaveLength(1);
+      expect(rows[0].id).toBe(openId);
+      expect(rows[0].used_at).toBeNull();
+      expect(new Date(rows[0].expires_at).getTime()).toBeGreaterThan(NOW.getTime() + 60_000);
+      const { getChat } = await import("@/lib/assistant/chat");
+      expect((await getChat(w.ann, w.slug, tick())).messages.find((m) => m.proposal)?.proposal).toMatchObject({ id: openId, status: "open" });
+      expect(await bookingsOf(w.ann.id)).toBe(0);
+    });
+
     it("a live provider with no key can't run a model, so it reserves no steps and serves the demo", async () => {
       setAi("scripted", { GEMINI_API_KEY: "" });
       const out = await say(w.ann, "anything tuesday?");

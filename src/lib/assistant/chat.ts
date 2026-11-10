@@ -1,8 +1,8 @@
 import "server-only";
 import { and, asc, desc, eq } from "drizzle-orm";
 import { z } from "zod";
-import { AiError, generate } from "@/lib/ai";
-import type { ChatMessage } from "@/lib/ai/types";
+import { AiError, ToolError, generate } from "@/lib/ai";
+import type { AnyToolDef, ChatMessage, ToolContext } from "@/lib/ai/types";
 import { type Actor, assertCan } from "@/lib/auth/rbac";
 import { todayInZone } from "@/lib/availability";
 import { db, schema } from "@/lib/db";
@@ -11,7 +11,7 @@ import { BadRequestError, NotFoundError, TooManyRequestsError } from "@/lib/erro
 import { log } from "@/lib/log";
 import { consumeRate, reserveDaily } from "@/lib/usage";
 import { MAX_SERVICE_REFS, buildSystemPrompt, sanitizeText } from "./prompt";
-import { type ProposalView, discardProposals, proposalViews } from "./proposals";
+import { type ProposalView, proposalViews } from "./proposals";
 import { createAssistantTools } from "./tools";
 
 /**
@@ -134,6 +134,28 @@ export async function loadHistory(actor: Actor, threadId: string): Promise<ChatM
   return messages;
 }
 
+/**
+ * generate() answers a failed live call by replaying the recorded demo script through the SAME tool handlers, and
+ * propose_booking would then supersede (expire) a card the customer already has open. In live mode that replay must do
+ * nothing. The script's first call is find_open_slots from `today + 1`, and we choose `today`: giving it this
+ * sentinel makes that first call recognisable (no real search is ever for 1900), after which the propose tools refuse
+ * for the rest of the turn. The replay's reads never reach a real handler either.
+ */
+const DEMO_REPLAY_TODAY = "1899-12-31";
+const DEMO_REPLAY_FROM = "1900-01-01";
+
+function blockDemoReplay(tools: AnyToolDef[]): AnyToolDef[] {
+  let replaying = false;
+  return tools.map((tool) => ({
+    ...tool,
+    async run(args: unknown, ctx: ToolContext) {
+      if (tool.name === "find_open_slots" && (args as { fromDate?: unknown }).fromDate === DEMO_REPLAY_FROM) replaying = true;
+      if (replaying) throw new ToolError("Not available.");
+      return tool.run(args, ctx);
+    },
+  }));
+}
+
 /** True when a real model can be called: a live provider is selected AND its key is set (else generate() serves the demo). */
 function liveModelAvailable(): boolean {
   const e = env();
@@ -196,16 +218,16 @@ export async function runChatTurn(actor: Actor, slug: unknown, input: unknown, n
       system,
       messages: [...history, { role: "user", content: message }],
       schema: answerSchema,
-      tools: tools.tools,
+      tools: live ? blockDemoReplay(tools.tools) : tools.tools,
       maxSteps: STEPS_PER_TURN,
       deadlineMs: TURN_DEADLINE_MS,
       maxOutputTokens: 600,
-      demoContext: { today, serviceName: services[0]?.name },
+      demoContext: { today: live ? DEMO_REPLAY_TODAY : today, serviceName: services[0]?.name },
     });
     if (live && result.demo) {
       // A live model that failed and fell back to the recorded script: never show the script's reply or card (the
-      // user didn't ask for that time). The steps it ran stay charged; whatever the script proposed is closed.
-      await discardProposals(actor, tools.created(), now);
+      // user didn't ask for that time). The replay was blocked (blockDemoReplay), so it wrote nothing and any card
+      // the customer already had stays open. The steps the live run used stay charged.
       reply = FALLBACK_REPLY;
       fallback = true;
     } else {
