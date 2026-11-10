@@ -250,6 +250,25 @@ describe.skipIf(!url || live)("booking assistant evals (scripted model, Postgres
     expect(await bookings()).toBe(0);
   });
 
+  it("2c. two proposals in one turn, the model names the first: the card is the latest (the only open one)", async () => {
+    installScript((req, n) => {
+      if (n === 1) return turn(call("find_open_slots", tuesday));
+      if (n === 2) return turn(call("propose_booking", { slotId: "A1" }));
+      if (n === 3) return turn(call("propose_booking", { slotId: "A2" }));
+      const ids = req.history.flatMap((h) => (h.role === "tool_results" ? h.results.filter((r) => r.name === "propose_booking") : []));
+      const first = (ids[0].output as { data: { proposalId: string } }).data.proposalId;
+      return turn(respond({ reply: "Tap Confirm.", proposalId: first }));
+    });
+    const out = await say(w.ann, "tuesday after 3, maybe two options");
+    const rows = await sql`select id, expires_at > ${new Date(NOW.getTime() + 5 * 60_000)}::timestamptz as open from booking_proposal where customer_id = ${w.ann.id} order by expires_at desc`;
+    expect(rows).toHaveLength(2);
+    expect(rows.filter((r) => r.open)).toHaveLength(1);
+    expect(out.proposal?.id).toBe(rows.find((r) => r.open)!.id);
+    expect(out.proposal).toMatchObject({ status: "open", startsAt: "2026-06-02T21:15:00.000Z" });
+    const { confirmProposal } = await import("@/lib/assistant/proposals");
+    expect((await confirmProposal(w.ann, out.proposal!.id, tick())).booking.startsAt).toBe("2026-06-02T21:15:00.000Z");
+  });
+
   it("5b. a proposal id the model invents, or one it copies from elsewhere, never reaches the client", async () => {
     // Ann's proposal from an earlier turn, which Bob's model tries to reuse.
     const annsOut = await (async () => {

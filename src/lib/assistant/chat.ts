@@ -212,10 +212,10 @@ export async function runChatTurn(actor: Actor, slug: unknown, input: unknown, n
       demo = result.demo;
       reply = result.data.reply;
       suggestions = result.data.suggestions.map((s) => sanitizeText(s, 40)).filter(Boolean);
-      // Only a proposal this turn's handlers created for this actor counts; if the model forgot to name it, the
-      // latest one is used. Either way the card is rendered from the row, not from anything the model wrote.
-      const mine = tools.created();
-      proposalId = result.data.proposalId && mine.includes(result.data.proposalId) ? result.data.proposalId : (mine.at(-1) ?? null);
+      // The card is the LATEST proposal this turn's handlers created for this actor: each propose call supersedes the
+      // earlier ones (they're expired), so a model-named id that isn't the latest would be an unusable card. The
+      // model's `proposalId` is ignored; the card is always rendered from the row, not from anything the model wrote.
+      proposalId = tools.created().at(-1) ?? null;
     }
   } catch (err) {
     if (err instanceof AiError && err.kind === "tool_loop") {
