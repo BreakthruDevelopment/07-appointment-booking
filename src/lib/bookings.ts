@@ -60,6 +60,8 @@ export type BookingView = {
   status: "confirmed" | "cancelled";
   cancelledBy: "customer" | "provider" | null;
   cancelledAt: string | null;
+  /** The last moment this viewer can cancel online: the customer until `starts_at - min notice`, the provider until the start. */
+  cancelBy: string;
   sequence: number;
   createdAt: string;
 };
@@ -124,6 +126,7 @@ function toView(row: Row, actor: Actor): BookingView {
     status: row.status,
     cancelledBy: row.cancelledBy,
     cancelledAt: row.cancelledAt ? row.cancelledAt.toISOString() : null,
+    cancelBy: new Date(row.startsAt.getTime() - (role === "provider" ? 0 : row.minNoticeMinutes * 60_000)).toISOString(),
     sequence: row.sequence,
     createdAt: row.createdAt.toISOString(),
   };
