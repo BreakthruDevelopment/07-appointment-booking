@@ -1,0 +1,2 @@
+ALTER TABLE "booking" ADD CONSTRAINT "booking_slot_half_open" CHECK (lower_inc("booking"."slot") and not upper_inc("booking"."slot"));--> statement-breakpoint
+ALTER TABLE "booking" ADD CONSTRAINT "booking_blocked_half_open" CHECK (lower_inc("booking"."blocked") and not upper_inc("booking"."blocked"));

@@ -2,19 +2,19 @@ import Link from "next/link";
 import { DemoBadge, PageIntro, Panel, StatusBadge, buttonPrimary, buttonSecondary } from "@/components/ui";
 
 const features = [
-  { title: "Sign-in with roles", body: "Email and password out of the box, OIDC providers by config, admin and user roles enforced on the server." },
-  { title: "Postgres", body: "Typed schema and migrations with Drizzle. Every query checks who is asking." },
-  { title: "AI feature", body: "One gateway for every model call: input limits, validated JSON output, and a demo fallback." },
-  { title: "Any cloud", body: "One container image, deployed to AWS, Azure, Google Cloud or Oracle Cloud with Terraform." },
+  { title: "Provider profile", body: "Any signed-in user can publish a link, services, weekly hours, and days they are closed or open late." },
+  { title: "Open times", body: "Slots follow the provider's time zone, including daylight-saving gaps, with buffers, notice, and a booking horizon." },
+  { title: "No double booking", body: "A confirmed appointment blocks that time. The database rejects a second booking that overlaps it." },
+  { title: "Private setup", body: "Customers sign in to book. Another user, including an admin, cannot change a provider's hours or services." },
 ];
 
 export default function Home() {
   return (
     <>
       <PageIntro
-        section="Template"
-        title="A production-shaped starting point."
-        description="Each app in the portfolio starts from this template and replaces the example items with its own domain and AI feature."
+        section="Bookings"
+        title="Publish your hours. Let people book a free time."
+        description="Salons, clinics, tutors, and consultants share services and opening hours. Customers see real open slots in the provider's time zone."
         actions={
           <>
             <Link href="/sign-in" className={buttonPrimary}>

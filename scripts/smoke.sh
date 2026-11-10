@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # End-to-end smoke test against a running app (local, CI, or a deployed URL).
-# Signs up two users over HTTP and proves one can't delete the other's item.
+# Signs up two users, publishes one provider, and proves the other cannot edit that service.
 #   BASE_URL=https://app7.breakthruventures.ai ./scripts/smoke.sh
 set -euo pipefail
 
@@ -35,30 +35,78 @@ signup() {
     "$BASE_URL/api/auth/sign-up/email" >/dev/null || fail "sign-up failed for $email"
 }
 
+json_field() {
+  # Read JSON on stdin and print the value of a dotted path (objects only).
+  node -e 'let s="";process.stdin.on("data",d=>s+=d);process.stdin.on("end",()=>{const j=JSON.parse(s); let v=j; for (const k of process.argv[1].split(".")) v=v?.[k]; if (v===undefined||v===null) process.exit(1); process.stdout.write(String(v));})' "$1"
+}
+
 signup "$JAR_A" "smoke-a-$RUN_ID@example.test"
 signup "$JAR_B" "smoke-b-$RUN_ID@example.test"
 pass "two users signed up"
 
-code=$(curl -s -o /dev/null -w '%{http_code}' "$BASE_URL/api/items")
-[ "$code" = "401" ] || fail "anonymous list should be 401, got $code"
-pass "anonymous access refused"
+code=$(curl -s -o /dev/null -w '%{http_code}' "$BASE_URL/api/providers/missing-studio")
+[ "$code" = "404" ] || fail "unknown public provider should be 404, got $code"
+pass "unknown provider is 404"
 
-item=$(curl -fsS -b "$JAR_A" -H 'content-type: application/json' -H "origin: $BASE_URL" \
-  -d '{"title":"smoke item"}' "$BASE_URL/api/items") || fail "create item failed"
-id=$(echo "$item" | sed -E 's/.*"id":"([^"]+)".*/\1/')
-[ -n "$id" ] || fail "no item id in $item"
-pass "user A created an item"
+code=$(curl -s -o /dev/null -w '%{http_code}' -X PUT \
+  -H 'content-type: application/json' -H "origin: $BASE_URL" \
+  -d '{"slug":"anon-studio","displayName":"Nope","timeZone":"UTC","accepting":true,"minNoticeMinutes":0,"horizonDays":14}' \
+  "$BASE_URL/api/provider/profile")
+[ "$code" = "401" ] || fail "anonymous profile write should be 401, got $code"
+pass "anonymous profile write refused"
 
-code=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE -b "$JAR_B" -H "origin: $BASE_URL" "$BASE_URL/api/items/$id")
-[ "$code" = "403" ] || fail "user B deleting A's item should be 403, got $code"
-pass "user B blocked from A's item"
+SLUG="smoke-$RUN_ID"
+profile=$(curl -fsS -b "$JAR_A" -H 'content-type: application/json' -H "origin: $BASE_URL" -X PUT \
+  -d "{\"slug\":\"$SLUG\",\"displayName\":\"Smoke Studio\",\"bio\":\"\",\"timeZone\":\"UTC\",\"accepting\":true,\"minNoticeMinutes\":0,\"horizonDays\":30}" \
+  "$BASE_URL/api/provider/profile") || fail "create profile failed"
+echo "$profile" | grep -q '"slug":"'"$SLUG"'"' || fail "profile response missing slug: $profile"
+pass "user A published a provider profile"
 
-code=$(curl -s -o /dev/null -w '%{http_code}' -X POST -b "$JAR_A" -H "origin: $BASE_URL" "$BASE_URL/api/ai/summarize")
-[ "$code" = "200" ] || fail "AI summary should be 200, got $code"
-pass "AI summary responds"
+curl -fsS -b "$JAR_B" -H 'content-type: application/json' -H "origin: $BASE_URL" -X PUT \
+  -d "{\"slug\":\"smoke-b-$RUN_ID\",\"displayName\":\"Other Studio\",\"bio\":\"\",\"timeZone\":\"UTC\",\"accepting\":false,\"minNoticeMinutes\":0,\"horizonDays\":14}" \
+  "$BASE_URL/api/provider/profile" >/dev/null || fail "user B profile failed"
+pass "user B has their own profile"
 
-code=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE -b "$JAR_A" -H "origin: $BASE_URL" "$BASE_URL/api/items/$id")
-[ "$code" = "204" ] || fail "owner delete should be 204, got $code"
-pass "owner deleted their item"
+service=$(curl -fsS -b "$JAR_A" -H 'content-type: application/json' -H "origin: $BASE_URL" -X PUT \
+  -d '{"name":"Cut","durationMin":30,"active":true}' \
+  "$BASE_URL/api/provider/services") || fail "create service failed"
+SERVICE_ID=$(printf '%s' "$service" | json_field service.id) || fail "no service id in $service"
+pass "user A added a service"
+
+HOURS=$(node -e 'const hours=[]; for (let weekday=1; weekday<=7; weekday++) hours.push({weekday,startMin:0,endMin:1440}); process.stdout.write(JSON.stringify({hours}));')
+curl -fsS -b "$JAR_A" -H 'content-type: application/json' -H "origin: $BASE_URL" -X PUT \
+  -d "$HOURS" "$BASE_URL/api/provider/hours" >/dev/null || fail "save hours failed"
+pass "user A saved weekly hours"
+
+code=$(curl -s -o /dev/null -w '%{http_code}' -X PUT -b "$JAR_B" -H 'content-type: application/json' -H "origin: $BASE_URL" \
+  -d "{\"id\":\"$SERVICE_ID\",\"name\":\"Nope\",\"durationMin\":30}" \
+  "$BASE_URL/api/provider/services")
+[ "$code" = "404" ] || fail "user B editing A's service should be 404, got $code"
+pass "user B cannot edit A's service"
+
+public=$(curl -fsS "$BASE_URL/api/providers/$SLUG") || fail "public provider failed"
+printf '%s' "$public" | node -e 'let s="";process.stdin.on("data",d=>s+=d);process.stdin.on("end",()=>{const j=JSON.parse(s); const body=JSON.stringify(j); if(!j.provider||j.provider.displayName!=="Smoke Studio") process.exit(2); if (/"userId"/.test(body)||/"email"/.test(body)) process.exit(3);});' \
+  || fail "public provider leaked an owner field or missed the display name: $public"
+pass "public provider hides the owner"
+
+code=$(curl -s -o /dev/null -w '%{http_code}' "$BASE_URL/api/providers/smoke-b-$RUN_ID")
+[ "$code" = "404" ] || fail "a provider who is not accepting bookings should be 404 publicly, got $code"
+pass "non-accepting provider is not public"
+
+code=$(curl -s -o /dev/null -w '%{http_code}' -X PUT -b "$JAR_A" -H 'content-type: application/json' -H 'origin: https://evil.example' \
+  -d "{\"slug\":\"$SLUG\",\"displayName\":\"Hijack\",\"bio\":\"\",\"timeZone\":\"UTC\",\"accepting\":true,\"minNoticeMinutes\":0,\"horizonDays\":30}" \
+  "$BASE_URL/api/provider/profile")
+[ "$code" = "403" ] || fail "cross-origin profile PUT should be 403, got $code"
+pass "cross-origin write is refused"
+
+FROM=$(node -e 'process.stdout.write(new Date(Date.now()+60*60*1000).toISOString())')
+TO=$(node -e 'process.stdout.write(new Date(Date.now()+2*24*60*60*1000).toISOString())')
+slots=$(curl -fsS --get "$BASE_URL/api/providers/$SLUG/slots" \
+  --data-urlencode "serviceId=$SERVICE_ID" \
+  --data-urlencode "from=$FROM" \
+  --data-urlencode "to=$TO") || fail "slots request failed"
+printf '%s' "$slots" | node -e 'let s="";process.stdin.on("data",d=>s+=d);process.stdin.on("end",()=>{const j=JSON.parse(s); if(j.timeZone!=="UTC"||!Array.isArray(j.slots)||j.slots.length===0) process.exit(1);});' \
+  || fail "expected at least one open slot: $slots"
+pass "public slots include an open time"
 
 echo "SMOKE PASS"
