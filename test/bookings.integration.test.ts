@@ -39,6 +39,8 @@ describe.skipIf(!url)("bookings (Postgres)", () => {
 
   beforeAll(async () => {
     process.env.DATABASE_URL = url;
+    // A pool as big as the crowd, so all 10 concurrent requests really hold a connection at once.
+    process.env.DB_POOL_MAX = "10";
     process.env.BETTER_AUTH_SECRET ??= "x".repeat(32);
     process.env.APP_URL = "http://localhost:3000";
     sql = postgres(url!, { max: 2, onnotice: () => {} });
@@ -158,6 +160,32 @@ describe.skipIf(!url)("bookings (Postgres)", () => {
       expect(n).toBe(1);
     }
   }, 120_000);
+
+  it("waits for a provider edit in flight, then re-checks against it (no booking on a slot the edit closed)", async () => {
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => (release = resolve));
+    const editing = sql.begin(async (tx) => {
+      // What an edit of the provider's profile holds from its first write until it commits.
+      await tx`select user_id from provider_profile where user_id = ${prov.id} for update`;
+      await tx`update provider_profile set accepting = false where user_id = ${prov.id}`;
+      await held;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    let settled = false;
+    const booking = book(ann).then(
+      (v) => ((settled = true), v),
+      (e) => ((settled = true), Promise.reject(e)),
+    );
+    booking.catch(() => undefined);
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    expect(settled, "the booking must wait for the in-flight edit").toBe(false);
+    release();
+    await editing;
+    await expect(booking).rejects.toMatchObject({ status: 404 });
+    await sql`update provider_profile set accepting = true where user_id = ${prov.id}`;
+    const [{ n }] = await sql`select count(*)::int as n from booking where provider_id = ${prov.id}`;
+    expect(n).toBe(0);
+  });
 
   it("lets one customer's concurrent bookings through only up to the per-provider cap", async () => {
     const { createBooking } = await import("@/lib/bookings");

@@ -173,13 +173,20 @@ export async function createBooking(actor: Actor, input: unknown, now = new Date
       // One customer's bookings are serialised so the upcoming-booking caps can't be raced past.
       await advisoryLock(tx, `booking:customer:${actor.id}`);
 
+      // Lock the provider profile, then the service, against edits until this transaction ends (always in that
+      // order, which provider.ts also uses, so the two can't deadlock): a provider who closes the slot or
+      // changes the service mid-booking waits for us, so the re-check below stays true at commit.
+      const [found] = await tx.select({ providerId: schema.service.providerId }).from(schema.service).where(eq(schema.service.id, data.serviceId));
+      if (!found) throw new NotFoundError("That service doesn't exist.");
+      providerId = found.providerId;
+      if (providerId === actor.id) throw new BadRequestError("You can't book your own services.");
+      await tx.select({ id: schema.providerProfile.userId }).from(schema.providerProfile).where(eq(schema.providerProfile.userId, providerId)).for("share");
       const [owner] = await tx
         .select({ providerId: schema.service.providerId })
         .from(schema.service)
-        .where(eq(schema.service.id, data.serviceId));
+        .where(and(eq(schema.service.id, data.serviceId), eq(schema.service.providerId, providerId)))
+        .for("share");
       if (!owner) throw new NotFoundError("That service doesn't exist.");
-      providerId = owner.providerId;
-      if (providerId === actor.id) throw new BadRequestError("You can't book your own services.");
 
       const window = { from: startsAt, to: new Date(startsAt.getTime() + 60_000) };
       const loaded = await loadAvailability(providerId, data.serviceId, window.from, window.to, tx);

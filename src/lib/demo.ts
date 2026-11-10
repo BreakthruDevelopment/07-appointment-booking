@@ -3,7 +3,7 @@ import { TZDate } from "@date-fns/tz";
 import { and, eq, inArray } from "drizzle-orm";
 import { type Actor, ForbiddenError } from "@/lib/auth/rbac";
 import { availableSlots, loadAvailability } from "@/lib/availability";
-import { insertBookingRow } from "@/lib/bookings";
+import { insertBookingRow, pgError } from "@/lib/bookings";
 import { db, schema } from "@/lib/db";
 import { DEMO_EMAIL_DOMAIN, MARKER } from "@/lib/demo-identity";
 import { ConflictError, TooManyRequestsError } from "@/lib/errors";
@@ -51,7 +51,8 @@ export async function loadDemoWorkspace(actor: Actor, now = new Date()): Promise
   if (actor.role !== "admin") throw new ForbiddenError();
   const dst = nearestTransition(DEMO_TIME_ZONE, now);
 
-  const result = await db().transaction(async (tx) => {
+  const result = await db()
+    .transaction(async (tx) => {
     if (!(await reserveDaily(tx, "demo_load", DEMO_LOADS_PER_DAY))) {
       throw new TooManyRequestsError("The demo was loaded too many times today. Try again tomorrow.");
     }
@@ -151,7 +152,12 @@ export async function loadDemoWorkspace(actor: Actor, now = new Date()): Promise
       bookings++;
     }
     return { slug: DEMO_SLUG, services: services.length, customers: CUSTOMERS.length, bookings, dstDate: dst.date };
-  });
+    })
+    .catch((err: unknown) => {
+      // A real account or provider took a demo email or slug between the checks and the inserts.
+      if (pgError(err)?.code === "23505") throw new ConflictError("A real account or provider uses a demo email or link, so the demo wasn't loaded.");
+      throw err;
+    });
   log.info("demo.loaded", { bookings: result.bookings });
   return result;
 }

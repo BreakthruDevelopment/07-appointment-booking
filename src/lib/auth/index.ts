@@ -1,9 +1,11 @@
 import "server-only";
 import { betterAuth } from "better-auth";
 import { drizzleAdapter } from "better-auth/adapters/drizzle";
+import { APIError } from "better-auth/api";
 import { nextCookies } from "better-auth/next-js";
 import { admin } from "better-auth/plugins";
 import { db, schema } from "@/lib/db";
+import { MARKER, isDemoEmail } from "@/lib/demo-identity";
 import { env } from "@/lib/env";
 import { ac, DISABLED_AUTH_PATHS, roles } from "./permissions";
 
@@ -40,11 +42,26 @@ function createAuth() {
     // Admins manage roles, bans and accounts but cannot impersonate or reset passwords
     // (see permissions.ts). The paths are also blocked outright, as a second layer.
     disabledPaths: DISABLED_AUTH_PATHS,
+    // Nobody can sign up as, or turn an account into, a demo identity: the demo loader (src/lib/demo.ts)
+    // writes its rows directly with Drizzle and never goes through these hooks.
+    databaseHooks: {
+      user: {
+        create: { before: async (data) => refuseDemoIdentity(data) },
+        update: { before: async (data) => refuseDemoIdentity(data) },
+      },
+    },
     plugins: [
       admin({ ac, roles, defaultRole: "user", adminRoles: ["admin"] }),
       nextCookies(),
     ],
   });
+}
+
+function refuseDemoIdentity<T extends { email?: unknown; image?: unknown }>(data: T) {
+  if (isDemoEmail(data.email) || data.image === MARKER) {
+    throw new APIError("BAD_REQUEST", { message: "That email or image is reserved." });
+  }
+  return Promise.resolve({ data });
 }
 
 type Auth = ReturnType<typeof createAuth>;
