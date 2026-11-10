@@ -15,6 +15,20 @@
       "when": 1794291011766,
       "tag": "0001_shared-helpers",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1794291556532,
+      "tag": "0002_booking-schema",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1794291572366,
+      "tag": "0003_booking-exclusions",
+      "breakpoints": true
     }
   ]
 }

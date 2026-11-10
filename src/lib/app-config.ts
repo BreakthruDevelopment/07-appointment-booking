@@ -3,7 +3,7 @@
  * page all read APP_TITLE. Set APP_NAME in the environment, or change the default
  * below when an app is created from the template.
  */
-export const APP_TITLE = process.env.APP_NAME || "30 Apps Template";
+export const APP_TITLE = process.env.APP_NAME || "Appointment Booking";
 
 export const APP_DESCRIPTION = "Part of the Breakthru Ventures 30 apps in 30 days portfolio.";
 

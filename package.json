@@ -16,6 +16,7 @@
     "smoke": "bash scripts/smoke.sh"
   },
   "dependencies": {
+    "@date-fns/tz": "^1.5.0",
     "better-auth": "^1.7.15",
     "drizzle-orm": "^0.45.4",
     "next": "16.4.4",

@@ -1,15 +1,16 @@
-# 30 Apps Template
+# Appointment Booking
 
-The starting point for every app in Breakthru Ventures' **30 apps in 30 days** portfolio. Each app is a
-responsive web app with a Postgres database, sign-in with roles, one AI feature, and a single container
-image that deploys to AWS, Azure, Google Cloud or Oracle Cloud.
+Customers book a real open time with a salon, clinic, tutor, or consultant. Providers publish services and
+opening hours. This repo is one app in Breakthru Ventures' **30 apps in 30 days** portfolio.
 
 ## What this app does
 
-_Each app replaces this section: the customer problem, who uses it, and what the AI feature does._
-
-The template ships an example "items" feature: users manage their own items, admins see everyone's, and
-an AI summary describes the list.
+A provider is a profile on a normal user account: a public link, services, weekly hours, and date overrides.
+Open times are computed in the provider's time zone, including daylight-saving gaps and repeated hours, with
+buffers, a minimum notice, and a booking horizon. Confirmed bookings cannot overlap. Postgres exclusion
+constraints reject a second hold on the same time for that provider, and a second overlapping appointment for
+the same customer. Provider setup is private to that user, including from an admin. Booking, cancel, calendar
+feeds, and the chat assistant are separate steps.
 
 ## Architecture
 
