@@ -292,6 +292,38 @@ describe.skipIf(!url)("booking assistant (Postgres)", () => {
       }
     });
 
+    it("data functions validate their inputs with zod before any query runs", async () => {
+      const dbMod = await import("@/lib/db");
+      const { createBookProposal, createCancelProposal, discardProposals, proposalViews, confirmProposal, dismissProposal } = await import("@/lib/assistant/proposals");
+      const { loadHistory } = await import("@/lib/assistant/chat");
+      const s = scope(w.ann, await thread(w.ann));
+      const dbSpy = vi.spyOn(dbMod, "db");
+      const good = { serviceId: w.haircutId, startsAt: new Date(SLOT) };
+      const bad: Promise<unknown>[] = [
+        createBookProposal(s, { ...good, serviceId: "not-a-uuid" }, NOW),
+        createBookProposal(s, { ...good, startsAt: new Date("garbage") }, NOW),
+        createBookProposal(s, { ...good, startsAt: "2026-06-02T21:00:00" }, NOW), // no offset
+        createBookProposal(s, { ...good, startsAt: "tomorrow" }, NOW),
+        createBookProposal(s, { ...good, extra: 1 } as never, NOW),
+        createBookProposal({ ...s, threadId: "nope" }, good, NOW),
+        createBookProposal({ ...s, providerId: "p".repeat(129) }, good, NOW),
+        createBookProposal(s, good, new Date("garbage")),
+        createCancelProposal(s, "not-a-uuid", NOW),
+        createCancelProposal({ ...s, providerId: "" }, "00000000-0000-4000-8000-000000000000", NOW),
+        discardProposals(w.ann, ["x"], NOW),
+        discardProposals(w.ann, Array(101).fill("00000000-0000-4000-8000-000000000000"), NOW),
+        proposalViews(w.ann, ["x"], NOW),
+        loadHistory(w.ann, "x"),
+      ];
+      for (const attempt of bad) await expect(attempt).rejects.toMatchObject({ name: "ZodError" });
+      await expect(confirmProposal(w.ann, "x", NOW)).rejects.toMatchObject({ status: 404 });
+      await expect(dismissProposal(w.ann, "x", NOW)).rejects.toMatchObject({ status: 404 });
+      expect(dbSpy).not.toHaveBeenCalled();
+      dbSpy.mockRestore();
+      // An ISO datetime with an offset is accepted.
+      await expect(createBookProposal(s, { ...good, startsAt: "2026-06-02T15:00:00-06:00" }, NOW)).resolves.toMatchObject({ startsAt: new Date(SLOT) });
+    });
+
     it("an already-aborted signal stops before any query", async () => {
       const { createBookProposal } = await import("@/lib/assistant/proposals");
       const controller = new AbortController();
@@ -503,6 +535,32 @@ describe.skipIf(!url)("booking assistant (Postgres)", () => {
       // And the cap bites: with room for only 4 steps, the next such turn is refused.
       setAi("scripted", { AI_FALLBACK_TO_DEMO: "true", CHAT_DAILY_CAP: "4" });
       await expect(say(w.bob, "again")).rejects.toMatchObject({ status: 429 });
+    });
+
+    it("a turn that proposed and then failed attaches the proposal it committed, so the card isn't lost", async () => {
+      const { runChatTurn, PROPOSAL_FALLBACK_REPLY, getChat } = await import("@/lib/assistant/chat");
+      // An older card is open; this turn supersedes it, then the model never finishes (tool-call step limit).
+      const old = await propose(w.ann, SLOT3, w.haircutId, tick());
+      installScript((_req, n) =>
+        n === 1 ? turn(call("find_open_slots", { service: "S1", fromDate: "2026-06-02", toDate: "2026-06-02" })) : n === 2 ? turn(call("propose_booking", { slotId: "A1" })) : turn(call("list_my_bookings", {})),
+      );
+      const out = await runChatTurn(w.ann, w.slug, { message: "book tuesday", timeZone: TZ }, tick());
+      expect(out.fallback).toBe(true);
+      expect(out.proposal).toMatchObject({ kind: "book", status: "open" });
+      expect(out.proposal!.id).not.toBe(old.id);
+      expect(out.messages[1].text).toBe(PROPOSAL_FALLBACK_REPLY);
+      const saved = (await getChat(w.ann, w.slug, tick())).messages.at(-1)!;
+      expect(saved.proposal).toMatchObject({ id: out.proposal!.id, status: "open" });
+      // Invalid final output after a proposal is handled the same way.
+      installScript((_req, n) =>
+        n === 1 ? turn(call("find_open_slots", { service: "S1", fromDate: "2026-06-02", toDate: "2026-06-02" })) : n === 2 ? turn(call("propose_booking", { slotId: "A2" })) : turn(respond({ reply: "r".repeat(700), proposalId: null })),
+      );
+      const again = await runChatTurn(w.ann, w.slug, { message: "another time", timeZone: TZ }, tick());
+      expect(again.proposal).toMatchObject({ status: "open" });
+      expect(again.proposal!.id).not.toBe(out.proposal!.id);
+      expect(again.messages[1].text).toBe(PROPOSAL_FALLBACK_REPLY);
+      const open = await sql`select id from booking_proposal where customer_id = ${w.ann.id} and used_at is null and expires_at > ${new Date(NOW.getTime() + 60_000)}`;
+      expect(open.map((r) => r.id)).toEqual([again.proposal!.id]);
     });
 
     it("a live failure on a follow-up turn runs no demo script: the customer's open card stays open and nothing new is written", async () => {

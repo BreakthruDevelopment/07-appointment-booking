@@ -38,6 +38,30 @@ export type ProposalView = {
 
 export type ProposalScope = { actor: Actor; threadId: string; providerId: string };
 
+/**
+ * Boundary schemas for every exported data function here: parsed before any query runs. Ids are uuids (user ids
+ * are Better Auth's text ids, so those are bounded strings), instants are a valid Date or an ISO datetime WITH an
+ * offset, and nothing is unbounded.
+ */
+const idText = z.string().min(1).max(128);
+const instant = z.union([
+  z.date().refine((d) => !Number.isNaN(d.getTime()), "Invalid date"),
+  z.iso.datetime({ offset: true }).transform((s) => new Date(s)),
+]);
+const scopeSchema = z.object({
+  actor: z.object({ id: idText, role: z.enum(["user", "admin"]) }),
+  threadId: z.uuid(),
+  providerId: idText,
+});
+const bookInputSchema = z.object({ serviceId: z.uuid(), startsAt: instant }).strict();
+const idListSchema = z.array(z.uuid()).max(100);
+
+function parseScope(scope: ProposalScope): ProposalScope {
+  // Validate the shape, keep the caller's actor object (it is the authority for assertCan and ownership checks).
+  const parsed = scopeSchema.parse(scope);
+  return { actor: scope.actor, threadId: parsed.threadId, providerId: parsed.providerId };
+}
+
 /** Make `starts_at` a proposal can name: it must be a start the engine offers right now and is still free. */
 async function assertOffered(providerId: string, serviceId: string, startsAt: Date, now: Date): Promise<void> {
   const window = { from: startsAt, to: new Date(startsAt.getTime() + 60_000) };
@@ -70,12 +94,15 @@ async function supersedeOpen(scope: ProposalScope, now: Date, tx: Tx, signal?: A
 
 /** Propose booking `serviceId` at `startsAt`. The service must be this provider's: a foreign id is a 404. */
 export async function createBookProposal(
-  scope: ProposalScope,
-  input: { serviceId: string; startsAt: Date },
-  now: Date,
+  rawScope: ProposalScope,
+  rawInput: { serviceId: string; startsAt: Date | string },
+  rawNow: Date,
   signal?: AbortSignal,
 ): Promise<{ id: string; serviceName: string; startsAt: Date; expiresAt: Date }> {
-  assertCan(scope.actor, "create");
+  assertCan(rawScope.actor, "create");
+  const scope = parseScope(rawScope);
+  const input = bookInputSchema.parse(rawInput);
+  const now = instant.parse(rawNow);
   signal?.throwIfAborted();
   if (scope.providerId === scope.actor.id) throw new ConflictError("You can't book your own services.");
   const [service] = await db()
@@ -110,12 +137,15 @@ export async function createBookProposal(
  * booking (or a made-up id) is a 404, exactly as for the cancel route.
  */
 export async function createCancelProposal(
-  scope: ProposalScope,
-  bookingId: string,
-  now: Date,
+  rawScope: ProposalScope,
+  rawBookingId: string,
+  rawNow: Date,
   signal?: AbortSignal,
 ): Promise<{ id: string; serviceName: string; startsAt: Date; expiresAt: Date }> {
-  assertCan(scope.actor, "create");
+  assertCan(rawScope.actor, "create");
+  const scope = parseScope(rawScope);
+  const bookingId = z.uuid().parse(rawBookingId);
+  const now = instant.parse(rawNow);
   signal?.throwIfAborted();
   const [row] = await db()
     .select({
@@ -179,6 +209,7 @@ export async function confirmProposal(
 ): Promise<{ action: "booked" | "cancelled"; booking: BookingView }> {
   assertCan(actor, "create");
   const id = parseUuid(proposalId);
+  now = instant.parse(now);
   const owner = ownedBy({ ownerId: schema.bookingProposal.customerId }, actor, eq(schema.bookingProposal.id, id));
 
   const [claimed] = await db()
@@ -257,8 +288,10 @@ export async function confirmProposal(
 }
 
 /** Close proposals this turn made but must not show (their cards were never sent). Only the actor's own, still open. */
-export async function discardProposals(actor: Actor, ids: string[], now: Date): Promise<void> {
+export async function discardProposals(actor: Actor, rawIds: string[], rawNow: Date): Promise<void> {
   assertCan(actor, "create");
+  const ids = idListSchema.parse(rawIds);
+  const now = instant.parse(rawNow);
   if (ids.length === 0) return;
   await db()
     .update(schema.bookingProposal)
@@ -270,6 +303,7 @@ export async function discardProposals(actor: Actor, ids: string[], now: Date): 
 export async function dismissProposal(actor: Actor, proposalId: unknown, now = new Date()): Promise<{ id: string }> {
   assertCan(actor, "create");
   const id = parseUuid(proposalId);
+  now = instant.parse(now);
   const [row] = await db()
     .select({ id: schema.bookingProposal.id })
     .from(schema.bookingProposal)
@@ -285,10 +319,11 @@ export async function dismissProposal(actor: Actor, proposalId: unknown, now = n
 }
 
 /** Cards for the proposals with these ids, rebuilt from the rows (never from model text). Only the actor's own. */
-export async function proposalViews(actor: Actor, ids: string[], now = new Date()): Promise<Map<string, ProposalView>> {
+export async function proposalViews(actor: Actor, rawIds: string[], rawNow = new Date()): Promise<Map<string, ProposalView>> {
   assertCan(actor, "create");
+  const now = instant.parse(rawNow);
   const out = new Map<string, ProposalView>();
-  const unique = [...new Set(ids)].slice(0, 100);
+  const unique = [...new Set(idListSchema.parse(rawIds))];
   if (unique.length === 0) return out;
   const rows = await db()
     .select({

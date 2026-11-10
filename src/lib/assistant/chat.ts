@@ -29,6 +29,9 @@ export const TURNS_PER_HOUR = 20;
 export const STEPS_PER_TURN = 4;
 export const TURN_DEADLINE_MS = 24_000;
 export const FALLBACK_REPLY = "I couldn't finish that; here are the open times on the page.";
+/** Used when the turn failed after a proposal was already committed: the card is attached so it isn't lost. */
+export const PROPOSAL_FALLBACK_REPLY = "Here's the time I found. Tap to confirm.";
+export const CANCEL_PROPOSAL_FALLBACK_REPLY = "Here's the cancellation I set up. Tap to confirm.";
 const PAGE_MESSAGES = 50;
 
 const turnInput = z
@@ -79,6 +82,7 @@ function validZone(zone: string | undefined): string | null {
 type Provider = { id: string; slug: string; displayName: string; timeZone: string; services: { id: string; name: string; durationMin: number }[] };
 
 async function loadProvider(actor: Actor, slug: unknown): Promise<Provider> {
+  assertCan(actor, "create");
   const parsed = z.string().regex(/^[a-z0-9-]{3,40}$/).safeParse(slug);
   if (!parsed.success) throw new NotFoundError();
   const [profile] = await db()
@@ -98,6 +102,8 @@ async function loadProvider(actor: Actor, slug: unknown): Promise<Provider> {
 }
 
 async function getOrCreateThread(actor: Actor, providerId: string): Promise<string> {
+  assertCan(actor, "create");
+  z.string().min(1).max(128).parse(providerId);
   await db().insert(schema.chatThread).values({ customerId: actor.id, providerId }).onConflictDoNothing();
   const [thread] = await db()
     .select({ id: schema.chatThread.id })
@@ -116,6 +122,7 @@ function textOf(content: StoredContent): string {
 /** Last 10 messages, at most 5,000 characters, oldest dropped first; always starts with a user message. */
 export async function loadHistory(actor: Actor, threadId: string): Promise<ChatMessage[]> {
   assertCan(actor, "create");
+  z.uuid().parse(threadId);
   const rows = await db()
     .select({ role: schema.chatMessage.role, content: schema.chatMessage.content })
     .from(schema.chatMessage)
@@ -182,6 +189,17 @@ async function reserveTurn(actor: Actor, live: boolean): Promise<void> {
   });
 }
 
+/** The latest proposal this turn committed that can still be confirmed, or null. */
+async function latestOpenProposal(actor: Actor, created: string[], now: Date): Promise<ProposalView | null> {
+  if (created.length === 0) return null;
+  const views = await proposalViews(actor, created, now);
+  for (const id of [...created].reverse()) {
+    const view = views.get(id);
+    if (view?.status === "open") return view;
+  }
+  return null;
+}
+
 export async function runChatTurn(actor: Actor, slug: unknown, input: unknown, now = new Date()): Promise<TurnResult> {
   assertCan(actor, "create");
   const { message, timeZone } = turnInput.parse(input);
@@ -240,9 +258,17 @@ export async function runChatTurn(actor: Actor, slug: unknown, input: unknown, n
       proposalId = tools.created().at(-1) ?? null;
     }
   } catch (err) {
-    if (err instanceof AiError && err.kind === "tool_loop") {
-      reply = FALLBACK_REPLY;
+    // A propose call may already have committed (and superseded the customer's old card) before the model's later
+    // step failed. The newest of those cards that is still open is attached, so it isn't left unreachable.
+    const stranded = err instanceof AiError && (err.kind === "tool_loop" || err.kind === "invalid_output") ? await latestOpenProposal(actor, tools.created(), now) : null;
+    if (err instanceof AiError && (err.kind === "tool_loop" || stranded)) {
       fallback = true;
+      if (stranded) {
+        proposalId = stranded.id;
+        reply = stranded.kind === "cancel" ? CANCEL_PROPOSAL_FALLBACK_REPLY : PROPOSAL_FALLBACK_REPLY;
+      } else {
+        reply = FALLBACK_REPLY;
+      }
     } else {
       throw err;
     }
@@ -293,7 +319,10 @@ export async function getChat(actor: Actor, slug: unknown, now = new Date()): Pr
     .orderBy(desc(schema.chatMessage.createdAt), desc(schema.chatMessage.id))
     .limit(PAGE_MESSAGES);
   rows.reverse();
-  const ids = rows.flatMap((r) => (typeof (r.content as StoredContent).proposalId === "string" ? [(r.content as StoredContent).proposalId as string] : []));
+  const ids = rows.flatMap((r) => {
+    const pid = (r.content as StoredContent).proposalId;
+    return typeof pid === "string" && z.uuid().safeParse(pid).success ? [pid] : [];
+  });
   const views = await proposalViews(actor, ids, now);
   return {
     messages: rows
