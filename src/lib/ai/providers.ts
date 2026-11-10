@@ -1,5 +1,5 @@
 import { env } from "@/lib/env";
-import { type AiProvider, AiError } from "./types";
+import { type AiProvider, type ToolCall, type ToolHistoryItem, type ToolStepRequest, type ToolStepResult, AiError } from "./types";
 
 async function postOnce(url: string, headers: Record<string, string>, body: unknown, deadline: number) {
   try {
@@ -17,8 +17,9 @@ async function postOnce(url: string, headers: Record<string, string>, body: unkn
   }
 }
 
-async function post(url: string, headers: Record<string, string>, body: unknown): Promise<unknown> {
-  const deadline = Date.now() + env().AI_TIMEOUT_MS;
+/** `deadlineAt` (epoch ms) lets a tool loop bound this call by what is left of its own budget. */
+async function post(url: string, headers: Record<string, string>, body: unknown, deadlineAt?: number): Promise<unknown> {
+  const deadline = Math.min(Date.now() + env().AI_TIMEOUT_MS, deadlineAt ?? Infinity);
   let res = await postOnce(url, headers, body, deadline);
   // Free-tier models are often briefly overloaded: retry a 500/503 once if there's time left.
   if ((res.status === 500 || res.status === 503) && deadline - Date.now() > 3000) {
@@ -30,7 +31,15 @@ async function post(url: string, headers: Record<string, string>, body: unknown)
     // Never echo the response body: it can contain request details.
     throw new AiError(`Model provider returned HTTP ${res.status}`, "provider", res.status);
   }
-  return res.json();
+  try {
+    return await res.json();
+  } catch (err) {
+    // A body that stalls past the deadline rejects with the native timeout, not from postOnce().
+    if (err instanceof Error && (err.name === "TimeoutError" || err.name === "AbortError")) {
+      throw new AiError("Model provider timed out", "provider", "timeout");
+    }
+    throw err;
+  }
 }
 
 /**
@@ -70,7 +79,74 @@ export function geminiProvider(apiKey: string, model: string): AiProvider {
       if (!text) throw new AiError("Empty response from model", "invalid_output");
       return text;
     },
+
+    async step({ system, history, tools, forceRespond, maxOutputTokens, deadlineAt }: ToolStepRequest): Promise<ToolStepResult> {
+      const json = (await post(
+        `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`,
+        { "x-goog-api-key": apiKey },
+        {
+          systemInstruction: { parts: [{ text: system }] },
+          contents: history.map(geminiContent),
+          tools: [
+            {
+              functionDeclarations: tools.map((t) => ({
+                name: t.name,
+                description: t.description,
+                parametersJsonSchema: t.parameters,
+              })),
+            },
+          ],
+          toolConfig: {
+            functionCallingConfig: forceRespond
+              ? { mode: "ANY", allowedFunctionNames: ["respond"] }
+              : { mode: "AUTO" },
+          },
+          // No responseMimeType here: JSON mode and function calling can't be combined on every model.
+          generationConfig: {
+            maxOutputTokens,
+            ...(geminiThinkingConfig(model) ? { thinkingConfig: geminiThinkingConfig(model) } : {}),
+          },
+        },
+        deadlineAt,
+      )) as { candidates?: { content?: { role?: string; parts?: GeminiPart[] } }[] };
+      const content = json.candidates?.[0]?.content;
+      const parts = content?.parts;
+      if (!parts?.length) throw new AiError("Empty response from model", "invalid_output");
+      const calls: ToolCall[] = parts.flatMap((p, i) =>
+        p.functionCall ? [{ id: p.functionCall.id ?? `gemini-synthetic-${i}`, name: String(p.functionCall.name ?? ""), args: p.functionCall.args ?? {} }] : [],
+      );
+      const text = parts.filter((p) => !p.thought).map((p) => p.text ?? "").join("");
+      // The model's parts go back verbatim next turn: Gemini 3 rejects a follow-up (HTTP 400) that
+      // drops the thoughtSignature on a function-call part. Never edit, reorder or filter them.
+      return { calls, text, raw: { parts } };
+    },
   };
+}
+
+type GeminiPart = {
+  text?: string;
+  thought?: boolean;
+  thoughtSignature?: string;
+  functionCall?: { id?: string; name?: string; args?: unknown };
+};
+
+function geminiContent(item: ToolHistoryItem): { role: "user" | "model"; parts: unknown[] } {
+  switch (item.role) {
+    case "user":
+      return { role: "user", parts: [{ text: item.text }] };
+    case "assistant":
+      return { role: "model", parts: [{ text: item.text }] };
+    case "model_calls":
+      return { role: "model", parts: (item.raw as { parts: unknown[] }).parts };
+    case "tool_results":
+      // All responses to a model turn go in one content, in call order.
+      return {
+        role: "user",
+        parts: item.results.map((r) => ({
+          functionResponse: { ...(r.id.startsWith("gemini-synthetic-") ? {} : { id: r.id }), name: r.name, response: r.output },
+        })),
+      };
+  }
 }
 
 /** Anthropic Claude (Messages API). Optional: for clients who pay for it. */
@@ -113,7 +189,52 @@ export function anthropicProvider(apiKey: string, model: string): AiProvider {
       if (!text) throw new AiError("Empty response from model", "invalid_output");
       return text;
     },
+
+    async step({ system, history, tools, forceRespond, maxOutputTokens, deadlineAt }: ToolStepRequest): Promise<ToolStepResult> {
+      const json = (await post(
+        "https://api.anthropic.com/v1/messages",
+        { "x-api-key": apiKey, "anthropic-version": "2023-06-01" },
+        {
+          model,
+          max_tokens: maxOutputTokens,
+          system,
+          messages: history.map(anthropicMessage),
+          tools: tools.map((t) => ({ name: t.name, description: t.description, input_schema: t.parameters })),
+          tool_choice: forceRespond ? { type: "tool", name: "respond" } : { type: "auto" },
+        },
+        deadlineAt,
+      )) as { content?: AnthropicBlock[] };
+      const blocks = json.content;
+      if (!blocks?.length) throw new AiError("Empty response from model", "invalid_output");
+      const calls: ToolCall[] = blocks.flatMap((b) =>
+        b.type === "tool_use" ? [{ id: String(b.id), name: String(b.name ?? ""), args: b.input ?? {} }] : [],
+      );
+      const text = blocks.filter((b) => b.type === "text").map((b) => b.text ?? "").join("");
+      return { calls, text, raw: blocks };
+    },
   };
+}
+
+type AnthropicBlock = { type: string; id?: string; name?: string; input?: unknown; text?: string };
+
+function anthropicMessage(item: ToolHistoryItem): { role: "user" | "assistant"; content: unknown } {
+  switch (item.role) {
+    case "user":
+    case "assistant":
+      return { role: item.role, content: item.text };
+    case "model_calls":
+      return { role: "assistant", content: item.raw };
+    case "tool_results":
+      return {
+        role: "user",
+        content: item.results.map((r) => ({
+          type: "tool_result",
+          tool_use_id: r.id,
+          content: JSON.stringify(r.output),
+          ...("error" in r.output ? { is_error: true } : {}),
+        })),
+      };
+  }
 }
 
 /**
