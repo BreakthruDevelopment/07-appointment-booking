@@ -171,8 +171,8 @@ async function loadWhere(where: ReturnType<typeof sql>, serviceId: string, from:
         where b.provider_id = p.user_id
           and b.status = 'confirmed'
           and b.blocked && tstzrange(
-            ${from}::timestamptz - make_interval(mins => s.buffer_before_min),
-            ${to}::timestamptz + make_interval(mins => s.duration_min + s.buffer_after_min),
+            ${from.toISOString()}::timestamptz - make_interval(mins => s.buffer_before_min),
+            ${to.toISOString()}::timestamptz + make_interval(mins => s.duration_min + s.buffer_after_min),
             '[)'
           )
       ), '[]'::json) as busy

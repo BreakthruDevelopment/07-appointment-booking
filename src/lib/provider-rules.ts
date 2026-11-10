@@ -30,10 +30,17 @@ export const RESERVED_SLUGS = new Set([
   "www",
 ]);
 
-const ZONES = new Set(Intl.supportedValuesOf("timeZone"));
-
+// Intl.supportedValuesOf("timeZone") only lists canonical names and omits valid
+// IANA zones such as "UTC" or "US/Eastern", so ask the Intl engine directly.
 export function isKnownZone(timeZone: string): boolean {
-  return ZONES.has(timeZone);
+  if (timeZone.length < 1 || timeZone.length > 80) return false;
+  if (!/^[A-Za-z0-9_+\-/]+$/.test(timeZone)) return false;
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 const slug = z
