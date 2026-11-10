@@ -147,12 +147,12 @@ export function createAssistantTools(scope: AssistantScope): AssistantTools {
       "Propose booking one of the slots from the latest find_open_slots result. Nothing is booked: the customer must tap Confirm. Returns the proposalId to put in your final answer.",
     args: proposeBookingArgs,
     kind: "propose",
-    async run(args) {
+    async run(args, { signal }) {
       budget();
       const slot = slotRefs.get(args.slotId);
       if (!slot) throw new ToolError("Unknown slotId. Call find_open_slots first and use one of its slotIds.");
       try {
-        const made = await createBookProposal(scope, slot, scope.now);
+        const made = await createBookProposal(scope, slot, scope.now, signal);
         created.push(made.id);
         return {
           proposalId: made.id,
@@ -199,12 +199,12 @@ export function createAssistantTools(scope: AssistantScope): AssistantTools {
       "Propose cancelling one of the customer's own bookings from the latest list_my_bookings result. Nothing is cancelled: the customer must tap Confirm. Returns the proposalId to put in your final answer.",
     args: proposeCancelArgs,
     kind: "propose",
-    async run(args) {
+    async run(args, { signal }) {
       budget();
       const bookingId = bookingRefs.get(args.booking);
       if (!bookingId) throw new ToolError("Unknown booking. Call list_my_bookings first and use one of its references.");
       try {
-        const made = await createCancelProposal(scope, bookingId, scope.now);
+        const made = await createCancelProposal(scope, bookingId, scope.now, signal);
         created.push(made.id);
         return {
           proposalId: made.id,

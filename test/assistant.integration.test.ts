@@ -33,6 +33,7 @@ const url = process.env.TEST_DATABASE_URL;
 const P = "as";
 const SLOT = "2026-06-02T21:00:00.000Z"; // Tuesday 15:00 in Denver
 const SLOT2 = "2026-06-02T22:00:00.000Z";
+const SLOT3 = "2026-06-02T23:00:00.000Z";
 
 describe.skipIf(!url)("booking assistant (Postgres)", () => {
   let sql: postgres.Sql;
@@ -247,6 +248,89 @@ describe.skipIf(!url)("booking assistant (Postgres)", () => {
       const { tools } = await toolsFor(w.ann);
       for (let i = 0; i < 6; i++) await run(tools, "list_my_bookings", {});
       await expect(run(tools, "list_my_bookings", {})).rejects.toThrow(/limit for this turn/);
+    });
+  });
+
+  describe("proposals and timeouts", () => {
+    const openCount = async (customer: string) =>
+      Number((await sql`select count(*)::int as n from booking_proposal where customer_id = ${customer} and used_at is null and expires_at > ${NOW}`)[0].n);
+
+    it("a proposal handler that gets the thread lock after the deadline rolls back: the existing card stays open and nothing is added", async () => {
+      const { createBookProposal, createCancelProposal } = await import("@/lib/assistant/proposals");
+      const existing = await propose(w.ann, SLOT);
+      const s = scope(w.ann, await thread(w.ann));
+      for (const attempt of [
+        (signal: AbortSignal) => createBookProposal(s, { serviceId: w.haircutId, startsAt: new Date(SLOT2) }, NOW, signal),
+        async (signal: AbortSignal) => {
+          const { createBooking } = await import("@/lib/bookings");
+          const b = await createBooking(w.ann, { serviceId: w.haircutId, startsAt: SLOT3 }, NOW);
+          return createCancelProposal(s, b.id, NOW, signal);
+        },
+      ]) {
+        const controller = new AbortController();
+        let release!: () => void;
+        const held = new Promise<void>((r) => (release = r));
+        let locked!: () => void;
+        const lockTaken = new Promise<void>((r) => (locked = r));
+        // Another writer holds the thread lock past the deadline.
+        const holder = sql.begin(async (tx) => {
+          await tx`select pg_advisory_xact_lock(hashtextextended(${`proposal:thread:${s.threadId}`}, 0))`;
+          locked();
+          await held;
+        });
+        await lockTaken;
+        const slow = attempt(controller.signal);
+        const outcome = slow.then(() => "created", (e: unknown) => (e as Error).name);
+        await new Promise((r) => setTimeout(r, 150));
+        controller.abort(); // the turn deadline fires while the handler waits for the lock
+        release();
+        await holder;
+        expect(await outcome).toBe("AbortError");
+        const [card] = await sql`select expires_at from booking_proposal where id = ${existing.id}`;
+        expect(new Date(card.expires_at).getTime()).toBe(existing.expiresAt.getTime());
+        expect(Number((await sql`select count(*)::int as n from booking_proposal where customer_id = ${w.ann.id}`)[0].n)).toBe(1);
+      }
+    });
+
+    it("an already-aborted signal stops before any query", async () => {
+      const { createBookProposal } = await import("@/lib/assistant/proposals");
+      const controller = new AbortController();
+      controller.abort();
+      await expect(createBookProposal(scope(w.ann, await thread(w.ann)), { serviceId: w.haircutId, startsAt: new Date(SLOT) }, NOW, controller.signal)).rejects.toMatchObject({ name: "AbortError" });
+      expect(await openCount(w.ann.id)).toBe(0);
+    });
+
+    it("releasing a failed claim while a newer card is open expires the claimed one: only the newer card stays open", async () => {
+      const { confirmProposal } = await import("@/lib/assistant/proposals");
+      const { createBooking } = await import("@/lib/bookings");
+      const a = await propose(w.ann, SLOT);
+      // Make A's booking fail with a retryable error once it is claimed: the slot is taken by someone else.
+      await createBooking(w.bob, { serviceId: w.haircutId, startsAt: SLOT }, NOW);
+      const bookingsMod = await import("@/lib/bookings");
+      const real = bookingsMod.createBooking;
+      let b!: Awaited<ReturnType<typeof propose>>;
+      const spy = vi.spyOn(bookingsMod, "createBooking").mockImplementation(async (...args) => {
+        // While A is claimed (in flight), the customer asks for something else: supersedeOpen skips the claimed A.
+        b = await propose(w.ann, SLOT2);
+        return real(...args);
+      });
+      await expect(confirmProposal(w.ann, a.id, NOW)).rejects.toMatchObject({ status: 409 });
+      spy.mockRestore();
+      const [rowA] = await sql`select used_at, expires_at from booking_proposal where id = ${a.id}`;
+      expect(rowA.used_at).toBeNull();
+      expect(new Date(rowA.expires_at).getTime()).toBeLessThanOrEqual(NOW.getTime());
+      const open = await sql`select id from booking_proposal where customer_id = ${w.ann.id} and used_at is null and expires_at > ${NOW}`;
+      expect(open.map((r) => r.id)).toEqual([b.id]);
+      await expect(confirmProposal(w.ann, a.id, NOW)).rejects.toMatchObject({ extra: { code: "proposal_expired" } });
+    });
+
+    it("releasing a failed claim with no newer card still reopens it", async () => {
+      const { confirmProposal } = await import("@/lib/assistant/proposals");
+      const { createBooking } = await import("@/lib/bookings");
+      const a = await propose(w.ann, SLOT);
+      await createBooking(w.bob, { serviceId: w.haircutId, startsAt: SLOT }, NOW);
+      await expect(confirmProposal(w.ann, a.id, NOW)).rejects.toMatchObject({ status: 409 });
+      expect(await openCount(w.ann.id)).toBe(1);
     });
   });
 

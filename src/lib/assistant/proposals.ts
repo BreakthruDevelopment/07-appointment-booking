@@ -1,5 +1,5 @@
 import "server-only";
-import { and, eq, gt, inArray, isNull } from "drizzle-orm";
+import { and, eq, gt, inArray, isNull, ne } from "drizzle-orm";
 import { z } from "zod";
 import { type Actor, assertCan } from "@/lib/auth/rbac";
 import { availableSlots, loadAvailability } from "@/lib/availability";
@@ -48,10 +48,13 @@ async function assertOffered(providerId: string, serviceId: string, startsAt: Da
 }
 
 /** Older open proposals in the thread stop being confirmable once a newer one is made: the latest card wins. */
-async function supersedeOpen(scope: ProposalScope, now: Date, tx: Tx) {
+async function supersedeOpen(scope: ProposalScope, now: Date, tx: Tx, signal?: AbortSignal) {
   // One writer per thread at a time, so two concurrent proposals can't both stay open: the second waits, then
   // supersedes the first. (Transaction-scoped; released at commit.)
   await advisoryLock(tx, `proposal:thread:${scope.threadId}`);
+  // A handler whose turn already timed out may only get the lock now. It must not expire the customer's
+  // current card or add a proposal nobody will see: throwing here rolls the transaction back.
+  signal?.throwIfAborted();
   await tx
     .update(schema.bookingProposal)
     .set({ expiresAt: now })
@@ -70,8 +73,10 @@ export async function createBookProposal(
   scope: ProposalScope,
   input: { serviceId: string; startsAt: Date },
   now: Date,
+  signal?: AbortSignal,
 ): Promise<{ id: string; serviceName: string; startsAt: Date; expiresAt: Date }> {
   assertCan(scope.actor, "create");
+  signal?.throwIfAborted();
   if (scope.providerId === scope.actor.id) throw new ConflictError("You can't book your own services.");
   const [service] = await db()
     .select({ name: schema.service.name })
@@ -79,10 +84,11 @@ export async function createBookProposal(
     .where(and(eq(schema.service.id, input.serviceId), eq(schema.service.providerId, scope.providerId), eq(schema.service.active, true)));
   if (!service) throw new NotFoundError("That service doesn't exist.");
   await assertOffered(scope.providerId, input.serviceId, input.startsAt, now);
+  signal?.throwIfAborted();
 
   const expiresAt = new Date(now.getTime() + PROPOSAL_TTL_MS);
   const id = await db().transaction(async (tx) => {
-    await supersedeOpen(scope, now, tx);
+    await supersedeOpen(scope, now, tx, signal);
     const [row] = await tx
       .insert(schema.bookingProposal)
       .values({
@@ -107,8 +113,10 @@ export async function createCancelProposal(
   scope: ProposalScope,
   bookingId: string,
   now: Date,
+  signal?: AbortSignal,
 ): Promise<{ id: string; serviceName: string; startsAt: Date; expiresAt: Date }> {
   assertCan(scope.actor, "create");
+  signal?.throwIfAborted();
   const [row] = await db()
     .select({
       id: schema.booking.id,
@@ -134,7 +142,7 @@ export async function createCancelProposal(
   }
   const expiresAt = new Date(now.getTime() + PROPOSAL_TTL_MS);
   const id = await db().transaction(async (tx) => {
-    await supersedeOpen(scope, now, tx);
+    await supersedeOpen(scope, now, tx, signal);
     const [created] = await tx
       .insert(schema.bookingProposal)
       .values({ threadId: scope.threadId, customerId: scope.actor.id, kind: "cancel", bookingId: row.id, expiresAt })
@@ -185,11 +193,30 @@ export async function confirmProposal(
     throw new ConflictError("That confirmation expired. Ask the assistant again.", { code: "proposal_expired" });
   }
 
+  // Under the same per-thread lock as making a proposal. If a newer card was made while this one was claimed
+  // (supersedeOpen skipped it because it was claimed), reopening would leave two open cards: expire this one.
   const release = () =>
     db()
-      .update(schema.bookingProposal)
-      .set({ usedAt: null })
-      .where(and(owner, eq(schema.bookingProposal.usedAt, now)))
+      .transaction(async (tx) => {
+        await advisoryLock(tx, `proposal:thread:${claimed.threadId}`);
+        const [newer] = await tx
+          .select({ id: schema.bookingProposal.id })
+          .from(schema.bookingProposal)
+          .where(
+            and(
+              eq(schema.bookingProposal.threadId, claimed.threadId),
+              ownedBy({ ownerId: schema.bookingProposal.customerId }, actor),
+              ne(schema.bookingProposal.id, id),
+              isNull(schema.bookingProposal.usedAt),
+              gt(schema.bookingProposal.expiresAt, now),
+            ),
+          )
+          .limit(1);
+        await tx
+          .update(schema.bookingProposal)
+          .set(newer ? { usedAt: null, expiresAt: now } : { usedAt: null })
+          .where(and(owner, eq(schema.bookingProposal.usedAt, now)));
+      })
       .then(() => undefined, () => undefined);
 
   let result: { action: "booked" | "cancelled"; booking: BookingView };
