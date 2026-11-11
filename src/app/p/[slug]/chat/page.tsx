@@ -45,12 +45,18 @@ export default async function ProviderChatPage({ params }: Props) {
           <p className="rounded-card bg-background px-4 py-6 text-center text-sm text-muted" data-chat-own>
             This is your own page, so there&apos;s no one to book for. Customers chat with the assistant here.
           </p>
-        ) : provider.services.length === 0 ? (
-          <p className="rounded-card bg-background px-4 py-6 text-center text-sm text-muted" data-chat-no-services>
-            {provider.displayName} hasn&apos;t added any services yet. Check back soon.
-          </p>
         ) : (
-          <ChatPanel slug={provider.slug} providerName={provider.displayName} />
+          <>
+            {/* No active services means nothing new to book, but customers can still see their history, confirm a
+                pending cancel and ask to cancel an existing booking, so the panel stays. */}
+            {provider.services.length === 0 && (
+              <p className="mb-4 rounded-card bg-background px-4 py-3 text-sm text-muted" data-chat-no-services>
+                {provider.displayName} isn&apos;t taking new bookings right now. You can still ask about or cancel an
+                appointment you already have.
+              </p>
+            )}
+            <ChatPanel slug={provider.slug} providerName={provider.displayName} />
+          </>
         )}
       </Panel>
     </>
