@@ -23,3 +23,16 @@ export function LocalTime({ iso, providerZone }: { iso: string; providerZone: st
     </>
   );
 }
+
+/**
+ * One moment (for example the last time a booking can be cancelled online) in the viewer's zone, zone abbreviation
+ * included. Before the browser's zone is known it shows the provider's zone, which is also what the server renders.
+ */
+export function LocalMoment({ iso, providerZone, hook }: { iso: string; providerZone: string; hook?: string }) {
+  const viewer = useViewerZone();
+  return (
+    <time dateTime={iso} data-moment={hook}>
+      {formatDateTime(iso, viewer ?? providerZone)}
+    </time>
+  );
+}

@@ -4,7 +4,7 @@ import { StatusBadge, buttonSecondary } from "@/components/ui";
 import type { BookingView } from "@/lib/bookings";
 import { formatDateTime } from "@/lib/slot-format";
 import { CancelButton } from "./cancel-button";
-import { LocalTime } from "./local-time";
+import { LocalMoment, LocalTime } from "./local-time";
 
 /**
  * One booking as a card. Everything user-written (service, provider and customer names, the note) is a plain
@@ -62,11 +62,11 @@ export function BookingCard({
       {booking.customerNote && provider && <p className="whitespace-pre-line break-words rounded-card bg-background px-3 py-2 text-sm">Note: {booking.customerNote}</p>}
       {confirmed && !started && !cancelOpen && !provider && (
         <p className="text-sm text-muted" data-cancel-closed>
-          Online cancellation closed {formatDateTime(booking.cancelBy, booking.providerTz)}. Contact {booking.providerName} to change it.
+          Online cancellation closed <LocalMoment iso={booking.cancelBy} providerZone={booking.providerTz} hook="cancel-by" />. Contact {booking.providerName} to change it.
         </p>
       )}
       {cancelOpen && !provider && (
-        <p className="text-sm text-muted">You can cancel online until {formatDateTime(booking.cancelBy, booking.providerTz)}.</p>
+        <p className="text-sm text-muted">You can cancel online until <LocalMoment iso={booking.cancelBy} providerZone={booking.providerTz} hook="cancel-by" />.</p>
       )}
       <div className="flex flex-wrap items-start gap-2">
         <a href={`/api/bookings/${booking.id}/ics`} download className={buttonSecondary} data-action="ics">

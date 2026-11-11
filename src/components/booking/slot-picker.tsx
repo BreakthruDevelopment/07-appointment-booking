@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { buttonOutlineAccent, buttonPrimary, buttonSecondary, inputClass, labelClass } from "@/components/ui/styles";
 import {
   addDays,
@@ -69,10 +69,24 @@ export function SlotPicker({ slug, providerName, providerZone, horizonDays, serv
   const [outcome, setOutcome] = useState<Outcome>({ kind: "idle" });
   const [week, setWeek] = useState<Week | null>(null);
   const [extra, setExtra] = useState<Extra | null>(null);
+  const errorRef = useRef<HTMLDivElement>(null);
+  const focusedOutcome = useRef<Outcome | null>(null);
 
   const service = services.find((s) => s.id === serviceId);
   const weekKey = viewerZone && serviceId ? `${serviceId}|${viewerZone}|${weekOffset}|${tick}` : null;
   const loading = weekKey !== null && week?.key !== weekKey;
+
+  // A failed booking (a 409 with fresh times above all) can land below the fold on a phone, and a 409 also reloads the
+  // week, which changes the page height. Once the reload has settled, bring the alert into view and move focus to
+  // it, so keyboard and screen-reader users start from the message and the new times. Once per outcome.
+  useEffect(() => {
+    if (outcome.kind !== "error" || loading || focusedOutcome.current === outcome) return;
+    const el = errorRef.current;
+    if (!el) return;
+    focusedOutcome.current = outcome;
+    el.focus();
+    el.scrollIntoView({ block: "center" });
+  }, [outcome, loading]);
 
   useEffect(() => {
     if (!weekKey || !viewerZone) return;
@@ -305,7 +319,7 @@ export function SlotPicker({ slug, providerName, providerZone, horizonDays, serv
         )}
 
         {outcome.kind === "error" && (
-          <div role="alert" className="space-y-3 rounded-card border border-border bg-blocked-soft p-4 text-blocked" data-error-code={outcome.code ?? "error"}>
+          <div ref={errorRef} tabIndex={-1} role="alert" className="space-y-3 rounded-card border border-border bg-blocked-soft p-4 text-blocked outline-offset-2" data-error-code={outcome.code ?? "error"}>
             <p className="font-semibold">{outcome.message}</p>
             {outcome.code === "limit_reached" && (
               <Link href="/bookings" className={buttonSecondary}>
